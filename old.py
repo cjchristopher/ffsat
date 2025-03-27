@@ -77,3 +77,23 @@ def verify(
     )
 
     return unsat, None  # unsat_r
+
+
+    objective_map = [
+        # Distribute over objectives
+        {
+            "clauses": {
+                "lits": 0,  # distribute lits over k
+                "sign": 0,  # distribute sign over k
+                "mask": 0,  # distribute mask over k
+                "sparse": 0,  # distribute sparse over k
+                "weight": 0,  # distribute weight over k
+            },
+            "ffts": {
+                "dft": 0,  # distribute dft over k
+                "idft": 0,  # distribute idft over k
+            },
+            "forward_mask": 0,  # distribute forward_mask over k
+            "cards": 0,  # distribute cards over k
+        },
+    ]

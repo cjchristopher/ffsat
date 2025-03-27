@@ -1,24 +1,27 @@
-import os
-import sys
+# Uncomment if you need to inspect precise memory allocation/movements
+#import os
+#os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"  # Disable pre-allocation
+#os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"  # Use platform-specific allocator
+
 import typer
 import argparse
 from time import perf_counter as time
-
+from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor
+from typing import Optional as Opt, NamedTuple, Iterable, Any
+from jax.typing import ArrayLike as Array
+
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jaxopt import ProjectedGradient
+from jaxopt import ProjectedGradient#, ProximalGradient
 from jaxopt.projection import projection_box
-from typing import Optional as Opt, NamedTuple
-from jax.typing import ArrayLike as Array
 
 from boolean_whf import ClauseGroup, ApproxLenClauses, class_map, Objective, ClauseArrays
 from sat_loader import Formula
 
 jax.config.update("jax_enable_x64", True)
-from functools import partial
-from jax.profiler import annotate_function, TraceAnnotation
+# jax.config.update("jax_disable_jit", True)
 
 
 class Validators(NamedTuple):
@@ -42,7 +45,7 @@ def preprocess_all(sat: Formula, mode: Opt[int], threshold: int = 0) -> tuple[tu
         pass
 
     clause_grps: dict[str, ClauseGroup] = {}
-    if mode is not None:
+    if mode is not None and mode > 0:
         choice = valid_choice(str(mode))
     else:
         print("Please see the following clause type and clause length breakdowns and select an option:")
@@ -94,8 +97,8 @@ def preprocess_all(sat: Formula, mode: Opt[int], threshold: int = 0) -> tuple[tu
 
     empty_Clause = ClauseArrays(sparse=jnp.zeros((0, 0, n_var), dtype=int))
     empty_Validation = Objective(empty_Clause, None, None, jnp.zeros((0, 0), dtype=int))
-    objectives: list[Objective] = []
-    validation: dict[str, Objective] = {}
+    objectives = []
+    validation = {}
 
     for grp_type, grp in clause_grps.items():
         if not grp:
@@ -119,12 +122,12 @@ def preprocess_all(sat: Formula, mode: Opt[int], threshold: int = 0) -> tuple[tu
 
 @jax.jit
 def fval_one(x: Array, objective: Objective, weight: Array) -> Array:
-    lits, sign, _, _ = objective.clauses
+    lits, sign, _, _, _ = objective.clauses
     dft, idft = objective.ffts
     forward_mask = objective.forward_mask
+    assignment = sign * x[lits]
 
     # Evaluate ESPs
-    assignment = sign * x[lits]
     prod = jnp.prod(dft + assignment[:, None, :], axis=2, where=forward_mask)
     clause_eval = jnp.sum(idft * prod, axis=1).real
     cost = weight * clause_eval
@@ -133,61 +136,36 @@ def fval_one(x: Array, objective: Objective, weight: Array) -> Array:
 
 @jax.jit
 def fval_one_instrumented_sparse(x: Array, objective: Objective, weight: Array) -> Array:
-    with TraceAnnotation("extract_clauses"):
-        _, sign, _, onehot = objective.clauses
-        dft, idft = objective.ffts
-        forward_mask = objective.forward_mask
+    _, sign, _, onehot, _ = objective.clauses
+    dft, idft = objective.ffts
+    forward_mask = objective.forward_mask
 
-    with TraceAnnotation("compute_assignment"):
-        # Use matrix multiplication instead of indexing
-        xlits = jnp.einsum("v,clv->cl", x, onehot)
-        assignment = sign * xlits  # x[lits]
+    # Use matrix multiplication instead of indexing
+    xlits = jnp.einsum("v,clv->cl", x, onehot)  #
+    assignment = sign * xlits  # x[lits]
 
-    with TraceAnnotation("compute_prod"):
-        prod = jnp.prod(dft + assignment[:, None, :], axis=2, where=forward_mask)
-
-    with TraceAnnotation("compute_clause_eval"):
-        clause_eval = jnp.sum(idft * prod, axis=1).real
-
-    with TraceAnnotation("compute_cost"):
-        cost = weight * clause_eval
-        result = jnp.sum(cost)
-
-    return result
+    # Evaluate ESPs
+    prod = jnp.prod(dft + assignment[:, None, :], axis=2, where=forward_mask)
+    clause_eval = jnp.sum(idft * prod, axis=1).real
+    cost = weight * clause_eval
+    return jnp.sum(cost)
 
 
 @jax.jit
-def fval(x: Array, objs: tuple[Objective], num_objs: int, weight: Array) -> Array:
-    # TODO: Should the loop be a separate function which for jax.jit?
-    # TODO: This might be the choke point.
-    # TODO: JAX profiling.
+def fval(x: Array, objs: tuple[Objective, ...], weight: Array) -> Array:
     # TODO: Fix weight - keeping at 1 for now. #weight[i] eventually
-
-    def fval_body(cumul_res, objective):
-        jax.debug.print("{y}", y=objective[0])
-        res = cumul_res + fval_one(x, objective[0], weight)
-        return res, res
-
-    # weight = 1
-    # result = jax.lax.scan(fval_body, 0.0, objs)
-    # jax.lax.fori_loop(0, num_objs, fval_body, 0.0)
-    # return result
-    if len(objs) == 1:
-        cost = fval_one_instrumented_sparse(x, objs[0], weight)
-        return cost
-    else:
-        result = jax.lax.fori_loop(0, num_objs, fval_body, 0.0)
-        return result
-    # for objective in objs:
-    #     group_costs.append(fval_one(x, objective, weight))
-    # return jnp.sum(jnp.array(group_costs))
+    costs = []
+    for objective in objs:
+        costs.append(fval_one(x, objective, weight))
+        # costs.append(fval_one_instrumented_sparse(x, objective, weight))
+    return jnp.sum(jnp.array(costs))
 
 
 @jax.jit
-@partial(jax.profiler.annotate_function, name="verify_sparse")
 def verify_sparse(
     x0: Array, xor: Objective, cnf: Objective, eo: Objective, nae: Objective, card: Objective, amo: Objective
 ) -> dict[str, Array] | Array:
+    # Uses onehot encodings with einsum, instead of x[addr]. Would be better if BCOO was better supported?
     @jax.jit
     def unsats_xor(x0: Array, sparse: Array, sign: Array, mask: Array):
         assign = sign * jnp.einsum("v,clv->cl", x0, sparse, optimize=True)
@@ -257,7 +235,6 @@ def verify_sparse(
 
 
 @jax.jit
-@partial(jax.profiler.annotate_function, name="verify")
 def verify(
     x0: Array, xor: Objective, cnf: Objective, eo: Objective, nae: Objective, card: Objective, amo: Objective
 ) -> dict[str, Array] | Array:
@@ -278,6 +255,7 @@ def verify(
     def unsats_eo(x0: Array, lits: Array, sign: Array, mask: Array):
         assign = sign * x0[lits]
         unsat = jnp.sum(assign < 0, axis=1, where=mask) != 1
+        # jax.debug.print("{}", jnp.sum(unsat))
         return unsat
 
     @jax.jit
@@ -291,7 +269,10 @@ def verify(
     @jax.jit
     def unsats_card(x0: Array, lits: Array, sign: Array, mask: Array, cards: Array):
         assign = sign * x0[lits]
-        unsat = jnp.sum(assign < 0, axis=1, where=mask) < cards
+        # unsat = jnp.sum(assign < 0, axis=1, where=mask) < cards
+        sat_count = jnp.sum(assign < 0, axis=1, where=mask)
+        unsat = jnp.where(cards < 0, sat_count >= jnp.abs(cards), sat_count < cards)
+        # jax.debug.print("{}", jnp.sum(unsat))
         return unsat
 
     @jax.jit
@@ -329,67 +310,108 @@ def verify(
     return unsat
 
 
-def run_solver(tasks: int, num_vars: int, num_clause: int, objs: list[Objective], vals: Validators) -> float:
-    pg = ProjectedGradient(fun=fval, projection=projection_box, maxiter=500)
+def get_jax_object_size(obj: Iterable | Array):
+    if isinstance(obj, jnp.ndarray) or isinstance(obj, Array):
+        print(obj.nbytes / 1e9, "gb")
+        return obj.nbytes
+    elif isinstance(obj, Iterable):  # If it's a tuple/list, sum over elements
+        return sum(get_jax_object_size(item) for item in obj)
+    else:
+        return 0  # Ignore non-JAX objects
 
-    def opt(x0: Array, objs: list[Objective], num_objs: int, vals: Validators, weight: Array):
-        pg_res = pg.run(x0, hyperparams_proj=(-1, 1), objs=objs, num_objs=num_objs, weight=weight)
-        x0 = pg_res.params
-        iters = pg_res.state.iter_num
+
+def moreau_point_sampler(tasks: int, n_vars: int, fixed_vars: dict[int, int] = None) -> Array:
+    # block cipher over index?
+    # adaptive based on previous x0?
+    # random uniform? snapped?
+    # metropolis-hasting? simanneal? mcmc?
+    pass
+
+
+def hj_moreau_prox(x: Array, hyperparams: Any | None = None, scaling: float = 1):
+    pass
+
+
+def run_solver(
+    tasks: int, n_vars: int, n_clause: int, batch: int, objs: tuple[Objective, ...], vals: Validators
+) -> float:
+    pg = ProjectedGradient(fun=fval, projection=projection_box, maxiter=50000)
+    #prox = ProximalGradient(fun=fval, prox=hj_moreau_prox, maxiter=50000)
+
+    def opt(x0: Array, objs: tuple[Objective, ...] = None, vals: Validators = None, weight: Array = None):
+        # jax.debug.print("{}", x0)
+        x0, state = pg.run(x0, hyperparams_proj=(-1, 1), objs=objs, weight=weight)
+        # jax.debug.print("{}, {}", state, fval(x0, objs, weight))
         res = verify(x0, vals.xor, vals.cnf, vals.eo, vals.nae, vals.card, vals.amo)
-        return x0, res, iters
+        return x0, res, state.iter_num
 
-    def only_opt(x0: Array, objs: list[Objective], num_objs: int, weight: Array):
-        pg_res = pg.run(x0, hyperparams_proj=(-1, 1), objs=objs, num_objs=num_objs, weight=weight)
-        x0 = pg_res.params
-        return x0
+    weight = 1  # jnp.ones(n_clause) # eventually objs.weight???
+    v_opt = jax.jit(jax.vmap(opt, in_axes=(0, None, None, None), axis_name="batch"))
+    p_opt = jax.pmap(v_opt, in_axes=(0, None, None, None))
 
-    def only_val(x0: Array, vals: Validators):
-        res = verify_sparse(x0, vals.xor, vals.cnf, vals.eo, vals.nae, vals.card, vals.amo)
-        return res
+    # Upward adjust #tasks for batch and gpu count.
+    n_gpu = len(jax.devices("gpu"))
+    tasks = ((tasks + (batch * n_gpu - 1)) // (batch * n_gpu)) * (batch * n_gpu)
 
-    p_opt = jax.jit(jax.vmap(opt, in_axes=(0, None, None, None, None)))
-    vmap_optimize = jax.vmap(only_opt, in_axes=(0, None, None, None))
-    vmap_verify = jax.vmap(only_val, in_axes=(0, None))
-
-    num_objs = len(objs)
     best_unsat = np.inf
     best_x = None
-
     tic = 0
     t0 = time()
     while time() - t0 < 300:
         key = jax.random.PRNGKey(tic)
-        # x0 = jax.random.uniform(key, (tasks, num_vars), minval=-1.0, maxval=1.0)
-        x0 = jax.random.truncated_normal(key, -1.0, 1.0, shape=(tasks, num_vars))
-        # TODO fix weight
-        weight = jnp.ones(num_clause)
+        x0 = jax.random.truncated_normal(key, -1.0, 1.0, shape=(tasks, n_vars))
+        xInit = x0[:]
 
-        # # Time just the optimization
-        # start = time()
-        # optimized_x0 = vmap_optimize(x0, objs, num_objs, weight)
-        # optimize_time = time() - start
-        # # Time just the verification
-        # start = time()
-        # unsat = vmap_verify(optimized_x0, vals)
-        # verify_time = time() - start
+        # x0 = jnp.sign(xS) # start at vertices
+        # x0 = jnp.ones((1,n_vars)) # start at all false (1 job)
+        # x0 = jnp.zeros((1,n_vars)) # start at all all zeros (1 job)
 
-        # print(f"Optimization time: {optimize_time}s")
-        # print(f"Verification time: {verify_time}s")
-        # stamp = time()
-        # break
+        # Random ramsey construction point (e.g. a valid assignment with 0 otherwise)
+        # locs = jnp.where(jnp.arange(n_vars, dtype=float) % 3 == 0, -1, 0).reshape(1, n_vars)
+        # x0 = jnp.ones((1,n_vars))
+        # x0 = x0*locs
 
-        # Optimization
-        print("commencing projected gradient")
-        stamp1 = time()
-        x0, unsat, iters = p_opt(x0, objs, num_objs, vals, weight)
-        stamp2 = time()
-        print("returned to python after", stamp2 - stamp1)
-        print(f"Min iters: {jnp.min(iters)}, Max iters: {jnp.max(iters)}, Mean: {jnp.mean(iters)}")
+        res_x0 = []
+        res_unsat = []
+        res_iters = []
+        cumul_best = jnp.inf
 
+        pbar = tqdm(range(0, tasks // batch, n_gpu), "batches (best=inf)")
+        for i in pbar:
+            device_batches = []
+            for d in range(n_gpu):
+                start_idx = (i + d) * batch
+                end_idx = start_idx + batch
+                device_batches.append(x0[start_idx:end_idx])
+            stacked_batches = jnp.stack(device_batches)
+
+            # stamp1 = time()
+            batch_x0, batch_unsat, batch_iters = p_opt(stacked_batches, objs, vals, weight)
+            # stamp2 = time()
+            # print("returned to python after", stamp2 - stamp1)
+
+            # Collect results
+            for d in range(n_gpu):
+                res_x0.append(batch_x0[d])
+                res_unsat.append(batch_unsat[d])
+                res_iters.append(batch_iters[d])
+
+            batch_best = jnp.min(jnp.sum(batch_unsat, axis=1))
+            cumul_best = batch_best if batch_best < cumul_best else cumul_best
+            if batch_best == 0:
+                print(batch_unsat)
+                print("count a cost 0????")
+                break
+            pbar.set_description("batches (best={})".format(cumul_best))
+
+        x0 = jnp.concat(res_x0)[:tasks]
+        unsat = jnp.concat(res_unsat)[:tasks]
+        iters = jnp.concat(res_iters)[:tasks]
+
+        print(f"PGD Iters: min: {jnp.min(iters)}, max: {jnp.max(iters)}, mean: {jnp.mean(iters)}")
         unsat = unsat.sum(axis=1)
         min_unsat = unsat.min()
-        print("loops:", tic, "error/unsat", min_unsat)
+        print("Restarts:", tic, "Best found unsat count:", min_unsat)
 
         # This is essentially the number of jobs that got the clause wrong.
         # Weight for a clause goes to zero if all got it right - contributes nothing to grad?
@@ -399,16 +421,21 @@ def run_solver(tasks: int, num_vars: int, num_clause: int, objs: list[Objective]
         # weight = 0.9 * weight + 0.1 * reward / reward.max()
         # unsat = weight * unsat
 
-        stamp = time()
         if min_unsat < best_unsat:
             best_unsat = min_unsat
-            best_x = x0[jnp.argmin(unsat)]
-            print("{:.2f}/300.00 o {}".format(stamp - t0, best_unsat))
+            loc = jnp.argmin(unsat)
+            best_x = x0[loc]
+            best_x_start = xInit[loc]
+            best_iters = iters[loc]
+
+        stamp = time()
+        print("Total iter time: {:.2f}/300.00 o {} | iters {}".format(stamp - t0, best_unsat, best_iters))
 
         if best_unsat == 0:
+            print("SAT! at index {} with starting point {} (ending {})".format(loc, best_x_start, best_x))
             out_string = "v"
             assignment = []
-            for i in range(num_vars):
+            for i in range(n_vars):
                 lit = i + 1
                 if best_x[i] > 0:
                     out_string += " {}".format(-lit)
@@ -422,7 +449,7 @@ def run_solver(tasks: int, num_vars: int, num_clause: int, objs: list[Objective]
     return stamp - t0
 
 
-def main(dimacs: str = None, threads: int = 32, mode: Opt[int] = None):
+def main(dimacs: str = None, tasks: int = 32, batch: int = 16, mode: Opt[int] = None) -> None:
     if dimacs is None:
         print("Error: Please provide a (hybrid) dimacs CNF file")
         return 1
@@ -433,50 +460,39 @@ def main(dimacs: str = None, threads: int = 32, mode: Opt[int] = None):
     stamp2 = time()
     read_time = stamp2 - stamp1
 
-    num_vars = sat.n_var
-    num_clause = sat.n_clause
+    n_vars = sat.n_var
+    n_clause = sat.n_clause
     objectives, validation = preprocess_all(sat, mode)
     stamp1 = time()
     process_time = stamp1 - stamp2
 
-    total_mem = 0
-    for ob in objectives:
-        for item in ob:
-            if isinstance(item, jax.Array):
-                total_mem += sys.getsizeof(item)
-                continue
-            elif item is not None:
-                for arr in item:
-                    total_mem += sys.getsizeof(arr)
-            continue
-
     del sat
     print("Running Solver")
-    t_solve = run_solver(threads, num_vars, num_clause, objectives, validation)
+    t_solve = run_solver(tasks, n_vars, n_clause, batch, objectives, validation)
     print("Some stats")
     print("Time reading input:", read_time)
     print("Time processing to Arrays:", process_time)
-    print("upper bound gpu bytes:", total_mem)
+    # print("upper bound gpu bytes:", total_mem)
     print("Time spent solving", t_solve)
 
 
 if __name__ == "__main__":
-    print(sys.version)
     parser = argparse.ArgumentParser(description="Process a file with optional parameters")
     parser.add_argument("file", help="The file to process")
     parser.add_argument("-p", "--profile", action="store_true", help="Enable profiling")
-    parser.add_argument("-t", "--threads", type=int, default=32, help="Number of threads to use")
-    parser.add_argument("-m", "--mode", type=int, default=None, help="Which mode to use (bypass prompt)")
+    parser.add_argument("-t", "--tasks", type=int, default=32, help="Number of tasks to use")
+    parser.add_argument("-b", "--batch", type=int, default=16, help="Batch size per GPU")
+    parser.add_argument("-m", "--mode", type=int, default=1, help="Which mode to use. Provide 0 to be prompted")
 
     args = parser.parse_args()
 
-    if "XLA_FLAGS" in os.environ:
-        print(os.environ["XLA_FLAGS"])
-    else:
-        print("CHECK XLA FLAGS")
+    # if "XLA_FLAGS" in os.environ:
+    #     print(os.environ["XLA_FLAGS"])
+    # else:
+    #     print("CHECK XLA FLAGS")
     # Run with or without profiler based on the flag
     if args.profile:
         with jax.profiler.trace("/tmp/jax-trace", create_perfetto_link=True):
-            main(args.file, args.threads, args.mode)
+            main(args.file, args.tasks, args.batch, args.mode)
     else:
-        main(args.file, args.threads, args.mode)
+        main(args.file, args.tasks, args.batch, args.mode)

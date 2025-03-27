@@ -4,7 +4,7 @@ from abc import ABC, abstractmethod
 from jax.typing import ArrayLike as Array
 
 import jax.numpy as jnp
-from jax.experimental import sparse
+#from jax.experimental.sparse import BCOO
 import numpy as np
 from scipy.linalg import dft as dft_table
 from scipy.special import comb
@@ -27,6 +27,7 @@ class ClauseArrays(NamedTuple):
     sign: Array = jnp.zeros((0,0), dtype=int)
     mask: Array = jnp.zeros((0,0), dtype=bool)
     sparse: Array = jnp.zeros((0,0,0), dtype=int)
+    weight: Array = jnp.zeros((0,), dtype=float)
 
 
 class Objective(NamedTuple):
@@ -63,7 +64,7 @@ class ClauseGroup(ABC):
 
     def _to_array(self, clauses: list[Clause]) -> ClauseArrays:
         lits, card_ks = zip(*[(clause.lits, clause.card) for clause in clauses])
-        self.card_ks = jnp.array(card_ks) if any(card_ks) else None #.reshape(-1, 1)
+        self.card_ks = jnp.array(card_ks) if all(card_ks) else jnp.zeros((0,0), dtype=int) #.reshape(-1, 1)
         lits, mask = self._pad(lits)
         sign = np.zeros_like(lits)
         np.sign(lits, out=sign, where=mask)
@@ -72,13 +73,14 @@ class ClauseGroup(ABC):
         sign = jnp.sign(sign)
         lits = jnp.abs(lits)
         mask = jnp.array(mask)
+        weight = jnp.ones(lits.shape[0])
 
         # Use matrix multiplication instead of indexing
         sp_xlits = jnp.zeros((lits.shape[0], lits.shape[1], self.n_var))
         sp_xlits = sp_xlits.at[jnp.arange(lits.shape[0])[:, None], jnp.arange(lits.shape[1]), lits].set(1)
         #sp_xlits = sparse.BCOO.fromdense(sp_xlits)
 
-        return ClauseArrays(lits, sign, mask, sp_xlits)
+        return ClauseArrays(lits, sign, mask, sp_xlits, weight)
 
     def _fft(self, clauses: list[Clause]) -> tuple[FFT, Array]:
         dfts = []
@@ -101,6 +103,7 @@ class ClauseGroup(ABC):
                 # manual compute using closed form FWH Coefficients. 1/n applied to idft.
                 dft: Array = dft_table(n + 1)
                 coeff = self._wf_coeff(t, n, k)
+                print(t, n, k, np.sum(coeff))
                 idft = coeff[::-1] @ np.conjugate(dft) / (n + 1)
                 dft = dft[1].reshape(n + 1, 1)
                 self.live_cache[(t, n, k)] = (dft, idft)
@@ -214,6 +217,8 @@ class CardClauses(ClauseGroup):
         super().__init__(clauses, n_var, do_fft, fft_cache)
 
     def _wf_coeff(self, t: Opt[str], n: int, k: Opt[int] = None) -> Array:
+        negate = -1 if k < 0 else 1
+        k = abs(k)
         if k is None:
             print("ERROR: Cardinality clause detected with no cardinality specified", file=sys.stderr)
             raise TypeError
@@ -237,7 +242,8 @@ class CardClauses(ClauseGroup):
 
         noise_zeroes = np.array([-1] * (n - k) + [1] * (k - 1))
         noise_poly = np.polynomial.Polynomial.fromroots(noise_zeroes).coef
-        if (k - 1) % 2:  # include factor of -1 to an odd power - e.g when k is even.
+        if (k - 1) % 2:
+            # includes factor of -1 to an odd power - e.g when k is even.
             noise_poly *= -1
         numerators = np.array(comb(n - 1, k - 1, exact=True) * noise_poly)
 
@@ -246,14 +252,15 @@ class CardClauses(ClauseGroup):
         pascal_row[0] = pascal_row[-1] = 2**m
         pascal = 1
         # Manual computation rather than duplicating work with comb() n times.
-        for i in range(1, (m // 2) + 1):  # i = |S|-1, compute (n-1) choose (|S|-1).
+        for i in range(1, (m // 2) + 1):
+            # i = |S|-1, compute (n-1) choose (|S|-1).
             # n choose (i+1) = n choose i *(n-i)/(i+1)
             pascal = (pascal * (m - i + 1)) // i
             pascal_row[i] = pascal_row[m - i] = pascal * (2**m)
         denominators = np.array(pascal_row)
 
         d[0] = 2 * binom.cdf(k - 1, n, 0.5) - 1
-        d[1:] = numerators / denominators
+        d[1:] = negate*(numerators / denominators)
         return d
 
 
