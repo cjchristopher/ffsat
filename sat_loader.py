@@ -1,13 +1,13 @@
 import sys
-from boolean_whf import Clause, class_map
+from boolean_whf import Clause, class_idno
 
 
 class Formula(object):
     def __init__(self):
-        self.clauses_type: dict[str, list[Clause]] = {clause_class: [] for clause_class in class_map}
+        self.clauses_type: dict[str, list[Clause]] = {clause_class: [] for clause_class in class_idno}
         self.clauses_len: dict[int, list[Clause]] = {}
         self.clauses_all: list[Clause] = []
-        self.stats = {clause_class: {} for clause_class in class_map}
+        self.stats = {clause_class: {} for clause_class in class_idno}
         self.n_var = 0
         self.n_clause = 0
 
@@ -29,8 +29,8 @@ class Formula(object):
          Then the following applies:
          - Each constraint begins with a letter (excluding CNF) specifying its type:
            * '' : Standard CNF clause (e.g. "h 1 2 0" or "1 2 0")
-           * 'x': XOR (xor) constraint (e.g. "h x .. 0" or "x .. 0")
-           * 'n': NAE (not-all-equal) constraint (e.g. "h n .. 0" or "n .. 0")
+           * 'x[or]': XOR (xor) constraint (e.g. "h x .. 0" or "x .. 0", or "xor .. 0")
+           * 'n[ae]': NAE (not-all-equal) constraint (e.g. "h n .. 0" or "n .. 0", or "nae .. 0")
            * 'e[o]': EO (exactly-one) constraint (e.g. "h e .. 0", "h eo .. 0", or "eo .. 0")
            * 'a[mo]': AMO (at-most-one) constraint (e.g. "h a .. 0", "h amo .. 0", or "a .. 0")
            * 'd | card': Cardinality constraint. Cardinality has an additional formatting quirk:
@@ -72,7 +72,6 @@ class Formula(object):
                     else:
                         # Process constraint
                         # TODO: Fix format detection (dimacs vs pbo vs ???)
-                        # Check for dimacs vs weird modified(hybrid) dimacs/pbo
                         if h_tag == -1:  # only true once. Will cause files with inconsistent formatting to break
                             if split[0] == "h" or (split[0] == "1" and split[1] == "x"):
                                 h_tag = 1

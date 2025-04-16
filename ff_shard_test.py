@@ -3,239 +3,146 @@ import os
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"  # Disable pre-allocation
 os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"  # Use platform-specific allocator
 
-import typer
 import argparse
-from concurrent.futures import ThreadPoolExecutor
+from collections.abc import Callable
 from time import perf_counter as time
-from tqdm import tqdm
-from typing import Optional as Opt, NamedTuple
-from jax.typing import ArrayLike as Array
+from typing import Optional as Opt
 
-import numpy as np
 import jax
 import jax.numpy as jnp
-from jax.sharding import Mesh, PartitionSpec as P, NamedSharding
-from jaxopt import ProjectedGradient
+import numpy as np
+from jax.sharding import Mesh, NamedSharding
+from jax.sharding import PartitionSpec as P
+from jax.typing import ArrayLike as Array
+from jaxopt import LBFGSB, ProjectedGradient, ScipyBoundedMinimize
 from jaxopt.projection import projection_box
+from tqdm import tqdm
 
-from boolean_whf import ClauseGroup, ApproxLenClauses, class_map, Objective, ClauseArrays
+from boolean_whf import Objective, class_idno
 from sat_loader import Formula
+from utils import preprocess_to_matrix
 
 jax.config.update("jax_enable_x64", True)
+jax.config.update("jax_enable_checks", True)
+# jax.config.update("jax_disable_jit", True)
 
 
-class Validators(NamedTuple):
-    xor: Objective
-    cnf: Objective
-    eo: Objective
-    nae: Objective
-    card: Objective
-    amo: Objective
+def shard_objective(obj: Objective, mesh: Mesh, shard_spec: P) -> Objective:
+    # Objective sharding - shard the arrays along the first (clauses) dimension since eval is row-wise.
+    def shard_leaf(leaf):
+        if isinstance(leaf, jax.Array):
+            clause_sharding = NamedSharding(mesh, shard_spec)
+            return jax.device_put(leaf, clause_sharding)
+        return leaf
+
+    return jax.tree_util.tree_map(shard_leaf, obj)
 
 
-def valid_choice(value: str) -> int:
-    choice_map = {"1": "full", "2": "types", "3": "lens"}
-    if int(value) not in {1, 2, 3}:
-        raise typer.BadParameter("Choice must be 1, 2, or 3")
-    return choice_map[value]
+def eval_verify(
+    objs: tuple[Objective, ...],
+) -> tuple[Callable[[Array], tuple[Array, Array]], Callable[[Array], Array]]:
+    # Construct JAX sharded evaluator and verifier
+    def single_eval_verify(obj: Objective) -> tuple[Callable[[Array], Array], ...]:
+        lits = obj.clauses.lits
+        sign = obj.clauses.sign
+        weight = obj.clauses.weight
+        mask = obj.clauses.mask
+        cards = obj.clauses.cards
+        types = obj.clauses.types
+        # sparse = obj.clauses.sparse
 
-
-def preprocess_all(sat: Formula, mode: Opt[int], threshold: int = 0) -> tuple[tuple[Objective, ...], Validators]:
-    clause_grps: dict[str, ClauseGroup] = {}
-    if mode is not None and mode > 0:
-        choice = valid_choice(str(mode))
-    else:
-        print("Please see the following clause type and clause length breakdowns and select an option:")
-        print(
-            "Types count:\n\t",
-            [f"{x}: {len(y)} ({sat.stats[x]})" for (x, y) in sat.clauses_type.items() if y],
-        )
-        print("Lengths count\n\t", [f"{x}: {len(y)}" for (x, y) in sat.clauses_len.items()])
-        print(
-            "\tOptions:\n"
-            + "\t\t1: Full combine. Use single monolithlic array with all clauses appropriately padded\n"
-            + "\t\t2: By type. Separate padded array for each clause type\n"
-            + "\t\t3: By length. Separate (possibly minor padding) for each clause length (or length cluster)"
-        )
-        choice = typer.prompt("Options", type=valid_choice, default="2")
-
-    n_var = sat.n_var
-    # We need the breakdown by clause type anyway for quick validation.
-    for c_type, c_list in sat.clauses_type.items():
-        if c_list:
-            # Clauses present, do FFTs if user partition choice was by type.
-            clause_grps[c_type] = class_map[c_type](c_list, n_var, do_fft=(choice == "types"))
-        else:
-            clause_grps[c_type] = None
-
-    match choice:
-        case "full":
-            clause_grps["full"] = ApproxLenClauses(sat.clauses_all, n_var, do_fft=True)
-        case "lens":
-            # thresh = 0
-            # TODO: Implement clustering with some threshold?
-            for c_len, c_list in sat.clauses_len.items():
-                clause_grps[c_len] = ApproxLenClauses(c_list, n_var, do_fft=True)
-        case _:
-            # type already proesssed above.
-            pass
-
-    # Process groups!
-    def process_groups(clause_grps: dict[str, ClauseGroup], max_workers: Opt[int] = None):
-        def process(grp: ClauseGroup):
-            grp.process()
-
-        with ThreadPoolExecutor(max_workers=max_workers) as tpool:
-            tasks = [tpool.submit(process, grp) for grp in clause_grps.values() if grp]
-            for task in tasks:
-                task.result()
-
-    process_groups(clause_grps, max_workers=min(len(clause_grps), 8))
-
-    empty_Clause = ClauseArrays(sparse=jnp.zeros((0, 0, n_var), dtype=int))
-    empty_Validation = Objective(empty_Clause, None, None, jnp.zeros((0, 0), dtype=int))
-    objectives = []
-    validation = {}
-
-    for grp_type, grp in clause_grps.items():
-        if not grp:
-            # No clause set, so in clause_grps for validation, add the empty.
-            validation[grp_type] = empty_Validation
-            continue
-
-        # Valid clause set
-        objective = grp.get()
-        if grp_type in class_map:
-            # Required for validation
-            validation[grp_type] = objective
-        if choice == "types" or (grp_type not in class_map):
-            # Optimisation objective
-            objectives.append(objective)
-
-    objectives = tuple(sorted(objectives, key=lambda x: x.clauses.lits.shape[-1]))
-    validation = Validators(**validation)
-    return objectives, validation
-
-
-@jax.jit
-def verify(
-    x0: Array, xor: Objective, cnf: Objective, eo: Objective, nae: Objective, card: Objective, amo: Objective
-) -> Array:
-    @jax.jit
-    def unsats_xor(x0: Array, lits: Array, sign: Array, mask: Array):
-        assign = sign * x0[lits]
-        # Even count (%2==0) of True (<0) means the XOR is UNSAT.
-        unsat = jnp.sum(assign < 0, axis=1, where=mask) % 2 == 0
-        return unsat
-
-    @jax.jit
-    def unsats_cnf(x0: Array, lits: Array, sign: Array, mask: Array):
-        assign = sign * x0[lits]
-        unsat = jnp.min(assign, axis=1, where=mask, initial=float("inf")) > 0
-        return unsat
-
-    @jax.jit
-    def unsats_eo(x0: Array, lits: Array, sign: Array, mask: Array):
-        assign = sign * x0[lits]
-        unsat = jnp.sum(assign < 0, axis=1, where=mask) != 1
-        return unsat
-
-    @jax.jit
-    def unsats_nae(x0: Array, lits: Array, sign: Array, mask: Array):
-        assign = sign * x0[lits]
-        has_true = jnp.min(assign, axis=1, where=mask, initial=float("inf")) < 0
-        has_false = jnp.max(assign, axis=1, where=mask, initial=float("-inf")) > 0
-        unsat = jnp.logical_not(jnp.logical_and(has_true, has_false))
-        return unsat
-
-    @jax.jit
-    def unsats_card(x0: Array, lits: Array, sign: Array, mask: Array, cards: Array):
-        assign = sign * x0[lits]
-        sat_count = jnp.sum(assign < 0, axis=1, where=mask)
-        unsat = jnp.where(cards < 0, sat_count >= jnp.abs(cards), sat_count < cards)
-        return unsat
-
-    @jax.jit
-    def unsats_amo(x0: Array, lits: Array, sign: Array, mask: Array):
-        assign = sign * x0[lits]
-        unsat = jnp.sum(assign < 0, axis=1, where=mask) > 1
-        return unsat
-
-    unsat = jnp.array(
-        [
-            (jnp.sum(unsats_xor(x0, xor.clauses.lits, xor.clauses.sign, xor.clauses.mask))),
-            (jnp.sum(unsats_cnf(x0, cnf.clauses.lits, cnf.clauses.sign, cnf.clauses.mask))),
-            (jnp.sum(unsats_eo(x0, eo.clauses.lits, eo.clauses.sign, eo.clauses.mask))),
-            (jnp.sum(unsats_nae(x0, nae.clauses.lits, nae.clauses.sign, nae.clauses.mask))),
-            (jnp.sum(unsats_card(x0, card.clauses.lits, card.clauses.sign, card.clauses.mask, card.cards))),
-            (jnp.sum(unsats_amo(x0, amo.clauses.lits, amo.clauses.sign, amo.clauses.mask))),
-        ]
-    )
-    return unsat
-
-
-def run_solver(
-    tasks: int, n_vars: int, n_clause: int, batch: int, objs: tuple[Objective, ...], vals: Validators, debug_halt: int
-) -> float:
-    # Create device mesh
-    devices = jax.devices("gpu")
-    n_gpu = len(devices)
-    mesh = Mesh(devices, ("device",))
-
-    # Define partition specs for sharding
-    obj_spec = P("device")  # Shard first dimension of arrays in objective
-    batch_spec = P("device")  # Shard batch dimension across devices
-
-    # Create a function that evaluates a single objective with internal sharding
-    def get_sharded_evaluator(obj: Objective, weight: Array):
-        """Create an evaluator for a single objective that handles internal sharding."""
-        # Extract arrays from objective for explicit sharding
-        lits, sign, _, _, _ = obj.clauses
         dft, idft = obj.ffts
         forward_mask = obj.forward_mask
 
-        # Create a sharding specification for clause dimension
-        clause_sharding = NamedSharding(mesh, obj_spec)
+        def evaluate(x: Array) -> Array:
+            assignment = sign * x[lits]
+            prod = jnp.prod(dft + assignment[:, None, :], axis=2, where=forward_mask)
+            clause_eval = jnp.sum(idft * prod, axis=1).real
+            cost = weight * clause_eval
+            # if verbose:
+            #    jax.debug.print("Score: {},{}", jnp.sum(cost), jnp.sum(cost).shape)
+            return jnp.sum(cost)
 
-        # Create evaluation function that uses sharded arrays
-        def evaluate(x):
-            # Apply explicit sharding to input arrays before computation
-            # This is key - we tell JAX to shard these arrays explicitly at the start
-            with mesh:
-                # Add annotations to source arrays
-                lits_sharded = jax.device_put(lits, clause_sharding)
-                sign_sharded = jax.device_put(sign, clause_sharding)
-                dft_sharded = jax.device_put(dft, clause_sharding)
-                idft_sharded = jax.device_put(idft, clause_sharding)
-                mask_sharded = jax.device_put(forward_mask, clause_sharding)
+        def verify(x: Array) -> Array:
+            assign = sign * x[lits]
+            # assign = sign * jnp.einsum("v,clv->cl", x0, sparse) #sparse version.
 
-                # Compute with sharded arrays
-                assignment = sign_sharded * x[lits_sharded]
-                prod = jnp.prod(dft_sharded + assignment[:, None, :], axis=2, where=mask_sharded)
-                clause_eval = jnp.sum(idft_sharded * prod, axis=1).real
-                cost = weight * clause_eval
-                return jnp.sum(cost)
+            unsat = jnp.zeros_like(types, dtype=bool)
 
-        return evaluate
+            # xor (unsat if an even number of true (<0) assignments)
+            unsat_cond = jnp.sum(assign < 0, axis=1, where=mask) % 2 == 0
+            unsat_type = jnp.where(types == class_idno["xor"], unsat_cond, False)
+            unsat = unsat | unsat_type
 
-    # Create a function that evaluates all objectives for a given input
-    def get_full_evaluator(objs: tuple[Objective, ...], weight: Array):
-        """Create an evaluator for all objectives with proper sharding."""
-        # Create evaluators for each objective
-        evaluators = [get_sharded_evaluator(obj, weight) for obj in objs]
+            # cnf (unsat if min value in assignment is false (>0))
+            unsat_cond = jnp.min(assign, axis=1, where=mask, initial=jnp.inf) > 0
+            unsat_type = jnp.where(types == class_idno["cnf"], unsat_cond, False)
+            unsat = unsat | unsat_type
 
-        # Combine evaluators
-        def evaluate_all(x):
-            costs = [eval_fn(x) for eval_fn in evaluators]
-            return jnp.sum(jnp.array(costs))
+            # eo (unsat if true (<0) count != 1)
+            unsat_cond = jnp.sum(assign < 0, axis=1, where=mask) != 1
+            unsat_type = jnp.where(types == class_idno["eo"], unsat_cond, False)
+            unsat = unsat | unsat_type
 
-        return evaluate_all
+            # amo (unsat if true (<0) count >1)
+            unsat_cond = jnp.sum(assign < 0, axis=1, where=mask) > 1
+            unsat_type = jnp.where(types == class_idno["amo"], unsat_cond, False)
+            unsat = unsat | unsat_type
+
+            # nae (unsat IF NOT(AND(any_true, any_false))=T
+            unsat_cond = jnp.logical_not(
+                jnp.logical_and(
+                    (jnp.min(assign, axis=1, where=mask, initial=jnp.inf) < 0),  # any true?
+                    (jnp.max(assign, axis=1, where=mask, initial=-jnp.inf) > 0),  # any false?
+                )
+            )
+            unsat_type = jnp.where(types == class_idno["nae"], unsat_cond, False)
+            unsat = unsat | unsat_type
+
+            # card
+            card_count = jnp.sum(assign < 0, axis=1, where=mask)
+            unsat_cond = jnp.where(cards < 0, card_count >= jnp.abs(cards), card_count < cards)
+            unsat_type = jnp.where(types == class_idno["card"], unsat_cond, False)
+            unsat = unsat | unsat_type
+            return unsat
+
+        return evaluate, verify
+
+    evaluators, verifiers = zip(*[single_eval_verify(obj) for obj in objs])
+
+    def evaluate_all(x: Array) -> tuple[Array, Array]:
+        costs = [eval_fn(x) for eval_fn in evaluators]
+        cost = jnp.sum(jnp.array(costs))
+        return cost, cost  # aux info
+
+    def verify_all(x: Array) -> Array:
+        all_res = [res_fn(x) for res_fn in verifiers]
+        res = jnp.array(all_res)
+        return res
+
+    return evaluate_all, verify_all
+
+
+def next_x_batch(batch_x: Array) -> Array:
+    pass
+
+
+def run_solver(
+    tasks: int, n_vars: int, n_clause: int, batch: int, objs: tuple[Objective, ...], init_x: Opt[str], debug_halt: int
+) -> float:
+    # Create device mesh, declare JAX specs, and shard:
+    devices = jax.devices("gpu")
+    n_gpu = len(devices)
+    mesh = Mesh(devices, ("device",))
+    shard_spec = P("device")
+
+    with mesh:
+        sharded_objs = tuple(shard_objective(obj, mesh, shard_spec) for obj in objs)
 
     # Upward adjust #tasks for batch and gpu count
     batch_size = batch * n_gpu
     tasks = ((tasks + batch_size - 1) // (batch_size)) * (batch_size)
 
-    weight = jnp.ones(1)
     best_unsat = np.inf
     best_x = None
     tic = 0
@@ -244,6 +151,12 @@ def run_solver(
     while time() - t0 < 300:
         key = jax.random.PRNGKey(tic)
         x0 = jax.random.truncated_normal(key, -1.0, 1.0, shape=(tasks, n_vars))
+        if init_x:
+            x0 = jnp.load(init_x)  # jax.numpy.save("start_x.npy", best_x_start)
+            if len(x0.shape) == 1:
+                x0 = x0.reshape(1, x0.shape[0])
+            tasks = x0.shape[0]
+            batch = 16
         xInit = x0[:]
         res_x0 = []
         res_unsat = []
@@ -251,29 +164,28 @@ def run_solver(
         cumul_best = jnp.inf
 
         # Create a jitted function for optimizing a batch of inputs
-        def process_batch(x_batch: Array, weight: Array):
+        def process_batch(x_batch: Array):
             """Process a batch of inputs with sharding."""
-            # Create evaluator and optimizer
-            full_evaluator = get_full_evaluator(objs, weight)
-            pg = ProjectedGradient(fun=full_evaluator, projection=projection_box, maxiter=50000)
+            evaluator, verifier = eval_verify(sharded_objs)
 
-            # Use vmap to process multiple inputs in parallel
+            # pg = ProjectedGradient(fun=full_evaluator, projection=projection_box, maxiter=500, verbose=True, has_aux=True)
+            pg = LBFGSB(fun=evaluator, maxiter=500, verbose=True, has_aux=True)
+
             def optimize_one(x0):
-                # Run optimization
-                x_opt, state = pg.run(x0, hyperparams_proj=(-1, 1))
-                # Verify solution
-                res = verify(x_opt, vals.xor, vals.cnf, vals.eo, vals.nae, vals.card, vals.amo)
+                # x_opt, state = pg.run(x0, hyperparams_proj=(-1, 1))
+                # jax.debug.print("X: {}", x0)
+                x_opt, state = pg.run(x0, bounds=(-1 * jnp.ones_like(x0), jnp.ones_like(x0)))
+                # jax.debug.print("X: {}, \n {}", x_opt, x_opt == x0)
+                res = verifier(x_opt)
                 return x_opt, res, state.iter_num
 
-            # Use vmap with proper in_axes (we're handling device distribution separately)
+            # Declare parallelisation for optimiser for a single starting point in a sharded batch of points, and run.
             optimize_batch = jax.vmap(optimize_one)
-
-            # Apply the batch optimization with explicit device placement
-            x0_sharded = jax.lax.with_sharding_constraint(x_batch, NamedSharding(mesh, batch_spec))
+            x0_sharded = jax.lax.with_sharding_constraint(x_batch, NamedSharding(mesh, shard_spec))
             results = optimize_batch(x0_sharded)
             return results
 
-        jit_batch = jax.jit(process_batch, in_shardings=(NamedSharding(mesh, batch_spec), None))
+        jit_batch = jax.jit(process_batch, in_shardings=(NamedSharding(mesh, shard_spec), None))
 
         if debug_halt:
             dummy_batch = jnp.ones((batch_size, n_vars))
@@ -288,20 +200,21 @@ def run_solver(
             return 0
 
         # Process in batches suitable for devices
-        pbar = tqdm(range(0, tasks, batch_size), "batches (best=inf)")
-        for i in pbar:
+        batch_bar = tqdm(range(0, tasks, batch_size), "batches (best=inf)")
+        for i in batch_bar:
             # Get batch
             end_idx = min(i + batch_size, tasks)
-            batch_x0 = x0[i:end_idx]
+            batch_x0 = jnp.sign(x0[i:end_idx])
 
             # Pad if needed (to avoid JAX shape errors)
             if batch_x0.shape[0] < batch_size:
+                print("WARNING: PADDING BATCH")
                 # Use numpy to handle the condition
                 pad_size = int(batch_size - batch_x0.shape[0])
                 batch_x0 = jnp.pad(batch_x0, ((0, pad_size), (0, 0)))
 
             # Run optimization
-            opt_x0, opt_unsat, opt_iters = jit_batch(batch_x0, weight)
+            opt_x0, opt_unsat, opt_iters = jit_batch(batch_x0)
 
             # Store only valid results (no padding)
             valid_size = min(batch_size, tasks - i)
@@ -317,7 +230,7 @@ def run_solver(
                 print(opt_unsat)
                 print("count a cost 0????")
                 break
-            pbar.set_description("batches (best={})".format(cumul_best))
+            batch_bar.set_description("batches (best={})".format(cumul_best))
 
         x0 = jnp.concat(res_x0)[:tasks]
         unsat = jnp.concat(res_unsat)[:tasks]
@@ -340,6 +253,7 @@ def run_solver(
             best_unsat = min_unsat
             loc = jnp.argmin(unsat)
             best_x = x0[loc]
+            print(best_x)
             best_x_start = xInit[loc]
             best_iters = iters[loc]
 
@@ -348,7 +262,7 @@ def run_solver(
 
         if best_unsat == 0:
             print("SAT! at index {} with starting point {} (ending {})".format(loc, best_x_start, best_x))
-            jax.numpy.save("start_x.npy", best_x_start)
+            # jax.numpy.save("start_x.npy", best_x_start)
             out_string = "v"
             assignment = []
             for i in range(n_vars):
@@ -365,7 +279,9 @@ def run_solver(
     return stamp - t0
 
 
-def main(dimacs: str = None, tasks: int = 32, batch: int = 16, mode: Opt[int] = None, init_x: str = None, debug_halt: int = 0) -> None:
+def main(
+    dimacs: str = None, tasks: int = 32, batch: int = 16, mode: Opt[int] = None, init_x: str = None, debug_halt: int = 0
+) -> None:
     if dimacs is None:
         print("Error: Please provide a (hybrid) dimacs CNF file")
         return 1
@@ -378,13 +294,13 @@ def main(dimacs: str = None, tasks: int = 32, batch: int = 16, mode: Opt[int] = 
 
     n_vars = sat.n_var
     n_clause = sat.n_clause
-    objectives, validation = preprocess_all(sat, mode)
+    objectives, _ = preprocess_to_matrix(sat, mode)
     stamp1 = time()
     process_time = stamp1 - stamp2
 
     del sat
     print("Running Solver")
-    t_solve = run_solver(tasks, n_vars, n_clause, batch, objectives, validation, init_x, debug_halt)
+    t_solve = run_solver(tasks, n_vars, n_clause, batch, objectives, init_x, debug_halt)
     print("Some stats")
     print("Time reading input:", read_time)
     print("Time processing to Arrays:", process_time)
@@ -398,13 +314,19 @@ if __name__ == "__main__":
     parser.add_argument("-t", "--tasks", type=int, default=32, help="Number of tasks to use")
     parser.add_argument("-b", "--batch", type=int, default=16, help="Batch size per GPU")
     parser.add_argument("-m", "--mode", type=int, default=1, help="Which mode to use. Provide 0 to be prompted")
-    parser.add_argument("-i", "--init_x", type=str, default=None, help="An initial array of x starting points in .npy format. Overrides -t and -b.")
+    parser.add_argument(
+        "-i",
+        "--init_x",
+        type=str,
+        default=None,
+        help="An initial array of x starting points in .npy format. Overrides -t and -b.",
+    )
     parser.add_argument(
         "-d",
         "--debug_jaxpr",
         type=int,
         default=0,
-        help="Will emit the jax expression of the JIT search and exit. It is recommended you pipe output to file.",
+        help="Will emit the jax expression of the JITted algorithm and exit. It is recommended you direect output to file.",
     )
 
     args = parser.parse_args()

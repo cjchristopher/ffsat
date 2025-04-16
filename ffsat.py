@@ -1,123 +1,28 @@
 # Uncomment if you need to inspect precise memory allocation/movements
-#import os
-#os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"  # Disable pre-allocation
-#os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"  # Use platform-specific allocator
+# import os
+# os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"  # Disable pre-allocation
+# os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"  # Use platform-specific allocator
 
-import typer
 import argparse
 from time import perf_counter as time
-from tqdm import tqdm
-from concurrent.futures import ThreadPoolExecutor
-from typing import Optional as Opt, NamedTuple, Iterable, Any
-from jax.typing import ArrayLike as Array
+from typing import Any, Iterable
+from typing import Optional as Opt
 
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jaxopt import ProjectedGradient#, ProximalGradient
+from jax.typing import ArrayLike as Array
+from jaxopt import ProjectedGradient  # , ProximalGradient
 from jaxopt.projection import projection_box
+from tqdm import tqdm
 
-from boolean_whf import ClauseGroup, ApproxLenClauses, class_map, Objective, ClauseArrays
+from boolean_whf import Objective
 from sat_loader import Formula
+from utils import Validators, preprocess_to_matrix
 
 jax.config.update("jax_enable_x64", True)
+jax.config.update('jax_enable_checks', True)
 # jax.config.update("jax_disable_jit", True)
-
-
-class Validators(NamedTuple):
-    xor: Objective
-    cnf: Objective
-    eo: Objective
-    nae: Objective
-    card: Objective
-    amo: Objective
-
-
-def valid_choice(value: str) -> int:
-    choice_map = {"1": "full", "2": "types", "3": "lens"}
-    if int(value) not in {1, 2, 3}:
-        raise typer.BadParameter("Choice must be 1, 2, or 3")
-    return choice_map[value]
-
-
-def preprocess_all(sat: Formula, mode: Opt[int], threshold: int = 0) -> tuple[tuple[Objective, ...], Validators]:
-    def approx_mem() -> float:
-        pass
-
-    clause_grps: dict[str, ClauseGroup] = {}
-    if mode is not None and mode > 0:
-        choice = valid_choice(str(mode))
-    else:
-        print("Please see the following clause type and clause length breakdowns and select an option:")
-        print(
-            "Types count:\n\t",
-            [f"{x}: {len(y)} ({sat.stats[x]})" for (x, y) in sat.clauses_type.items() if y],
-        )
-        print("Lengths count\n\t", [f"{x}: {len(y)}" for (x, y) in sat.clauses_len.items()])
-        print(
-            "\tOptions:\n"
-            + "\t\t1: Full combine. Use single monolithlic array with all clauses appropriately padded\n"
-            + "\t\t2: By type. Separate padded array for each clause type\n"
-            + "\t\t3: By length. Separate (possibly minor padding) for each clause length (or length cluster)"
-        )
-        choice = typer.prompt("Options", type=valid_choice, default="2")
-
-    n_var = sat.n_var
-    # We need the breakdown by clause type anyway for quick validation.
-    for c_type, c_list in sat.clauses_type.items():
-        if c_list:
-            # Clauses present, do FFTs if user partition choice was by type.
-            clause_grps[c_type] = class_map[c_type](c_list, n_var, do_fft=(choice == "types"))
-        else:
-            clause_grps[c_type] = None
-
-    match choice:
-        case "full":
-            clause_grps["full"] = ApproxLenClauses(sat.clauses_all, n_var, do_fft=True)
-        case "lens":
-            # thresh = 0
-            # TODO: Implement clustering with some threshold?
-            for c_len, c_list in sat.clauses_len.items():
-                clause_grps[c_len] = ApproxLenClauses(c_list, n_var, do_fft=True)
-        case _:
-            # type already proesssed above.
-            pass
-
-    # Process groups!
-    def process_groups(clause_grps: dict[str, ClauseGroup], max_workers: Opt[int] = None):
-        def process(grp: ClauseGroup):
-            grp.process()
-
-        with ThreadPoolExecutor(max_workers=max_workers) as tpool:
-            tasks = [tpool.submit(process, grp) for grp in clause_grps.values() if grp]
-            for task in tasks:
-                task.result()
-
-    process_groups(clause_grps, max_workers=min(len(clause_grps), 8))
-
-    empty_Clause = ClauseArrays(sparse=jnp.zeros((0, 0, n_var), dtype=int))
-    empty_Validation = Objective(empty_Clause, None, None, jnp.zeros((0, 0), dtype=int))
-    objectives = []
-    validation = {}
-
-    for grp_type, grp in clause_grps.items():
-        if not grp:
-            # No clause set, so in clause_grps for validation, add the empty.
-            validation[grp_type] = empty_Validation
-            continue
-
-        # Valid clause set
-        objective = grp.get()
-        if grp_type in class_map:
-            # Required for validation
-            validation[grp_type] = objective
-        if choice == "types" or (grp_type not in class_map):
-            # Optimisation objective
-            objectives.append(objective)
-
-    objectives = tuple(sorted(objectives, key=lambda x: x.clauses.lits.shape[-1]))
-    validation = Validators(**validation)
-    return objectives, validation
 
 
 @jax.jit
@@ -336,7 +241,7 @@ def run_solver(
     tasks: int, n_vars: int, n_clause: int, batch: int, objs: tuple[Objective, ...], vals: Validators
 ) -> float:
     pg = ProjectedGradient(fun=fval, projection=projection_box, maxiter=50000)
-    #prox = ProximalGradient(fun=fval, prox=hj_moreau_prox, maxiter=50000)
+    # prox = ProximalGradient(fun=fval, prox=hj_moreau_prox, maxiter=50000)
 
     def opt(x0: Array, objs: tuple[Objective, ...] = None, vals: Validators = None, weight: Array = None):
         # jax.debug.print("{}", x0)
@@ -462,7 +367,7 @@ def main(dimacs: str = None, tasks: int = 32, batch: int = 16, mode: Opt[int] = 
 
     n_vars = sat.n_var
     n_clause = sat.n_clause
-    objectives, validation = preprocess_all(sat, mode)
+    objectives, validation = preprocess_to_matrix(sat, mode)
     stamp1 = time()
     process_time = stamp1 - stamp2
 
