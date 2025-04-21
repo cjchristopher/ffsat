@@ -29,27 +29,22 @@ class ClauseArrays(NamedTuple):
     lits: Array = jnp.zeros((0, 0), dtype=int)
     sign: Array = jnp.zeros((0, 0), dtype=int)
     mask: Array = jnp.zeros((0, 0), dtype=bool)
-    weight: Array = jnp.zeros((0,), dtype=float)
-    # Any merit to making types negative, and positive numbers indicate card?
     types: Array = jnp.empty((0,), dtype=int)
     cards: Array = jnp.zeros((0, 0), dtype=int)
     sparse: Array = jnp.zeros((0, 0, 0), dtype=int)
 
 
 class Objective(NamedTuple):
-    clauses: ClauseArrays
-    ffts: Opt[FFT]
-    forward_mask: Opt[Array]
-    cards: Opt[Array]
+    clauses: ClauseArrays = ClauseArrays()
+    ffts: Opt[FFT] = None
+    forward_mask: Opt[Array] = None
 
 
 class_idno: dict[str, int] = {"xor": 1, "eo": 2, "nae": 3, "cnf": 4, "amo": 5, "card": 0}
 
 
 def empty_validator(n_var: int) -> ClauseArrays:
-    empty_ClauseArrays = ClauseArrays(sparse=jnp.zeros((0, 0, n_var), dtype=int))
-    empty_Validation = Objective(clauses=empty_ClauseArrays, cards = jnp.zeros((0, 0), dtype=int))
-    return empty_Validation
+    return Objective(clauses=ClauseArrays(sparse=jnp.zeros((0, 0, n_var), dtype=int)))
 
 
 class ClauseGroup:
@@ -80,9 +75,8 @@ class ClauseGroup:
         sign = jnp.where(mask, jnp.sign(lits), 0)
         lits = jnp.where(mask, jnp.abs(lits) - 1, lits)
         types = jnp.array(types)
-        cards = jnp.array(cards) if all(cards) else None
+        cards = jnp.array(cards)
         mask = jnp.array(mask)
-        weight = jnp.ones(lits.shape[0])
 
         sparse = None
         if sparse_mult:
@@ -91,7 +85,7 @@ class ClauseGroup:
             sparse = sparse.at[jnp.arange(lits.shape[0])[:, None], jnp.arange(lits.shape[1]), lits].set(1)
             # sparse = sparse.BCOO.fromdense(sparse)
 
-        return ClauseArrays(lits=lits, sign=sign, mask=mask, weight=weight, types=types, cards=cards, sparse=sparse)
+        return ClauseArrays(lits=lits, sign=sign, mask=mask, types=types, cards=cards, sparse=sparse)
 
     @classmethod
     def _wf_coeff_cnf(cls, n: int) -> Array:
@@ -309,9 +303,9 @@ class ClauseGroup:
 
     def get(self) -> Objective:
         if self.do_fft:
-            return Objective(self.clause_array, self.ffts, self.dft_mask, self.card_ks)
+            return Objective(clauses = self.clause_array, ffts=self.ffts, forward_mask=self.dft_mask)
         else:
-            return Objective(self.clause_array, None, None, self.card_ks)
+            return Objective(clauses = self.clause_array)
 
 
 # Create a function factory for backward compatibility with existing code

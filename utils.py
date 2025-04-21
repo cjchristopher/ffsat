@@ -44,7 +44,7 @@ def preprocess_to_matrix(sat: Formula, mode: Opt[int], threshold: int = 0) -> tu
             + "\t\t2: By type. Separate padded array for each clause type\n"
             + "\t\t3: By length. Separate (possibly minor padding) for each clause length (or length cluster)"
         )
-        choice = typer.prompt("Options", type=valid_choice, default="2")
+        choice = typer.prompt("Options", type=valid_choice, default="3")
 
     n_var = sat.n_var
     # We need the breakdown by clause type anyway for quick validation.

@@ -105,3 +105,28 @@ def unified_verify(x0: Array, obj: Objective):
     unsat = unsat | unsat_type
 
     return unsat
+
+if init_x:
+    x0 = jnp.load(init_x)  # jax.numpy.save("start_x.npy", best_x_start)
+    if len(x0.shape) == 1:
+        x0 = x0.reshape(1, x0.shape[0])
+    batch = 16
+
+if debug_halt:
+    dummy_batch = jnp.ones((gpu_batch, n_vars))
+    try:
+        jaxpr = jax.make_jaxpr(process_batch)(dummy_batch)
+        print(jaxpr)
+    except Exception as e:
+        print(f"Error making jaxpr: {e}")
+    # Stop execution if debug_halt is set
+    print("\nDebug halt requested, exiting")
+    return 0
+
+    parser.add_argument(
+        "-d",
+        "--debug_jaxpr",
+        type=int,
+        default=0,
+        help="Will emit the jax expression of the JITted algorithm and exit. It is recommended you direect output to file.",
+    )

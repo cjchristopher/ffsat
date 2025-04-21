@@ -6,3 +6,6 @@ Thoughts and Notes:
 * Finding Global Minima:
 * * HJ-Moreau Descent looks like a good candidate, but the nature of the sampling still poses problems for global convergence inside the hypercube - it seems like you would still need to get lucky to sample near the global minima for this idea to work.
 * * The notion of what to do near the cube edges (Where the solution will be if exists) is trickier. You could "mirror" the cube infinitely along the boundaries (e.g. if parameter x_i is updated such that |x_i|>1 then "treat" x_i as having the value x_i - sign(x_i)*2(|x_i|-1) - that is x_i = -1.05 will be evaluated as "-0.95", -2 as "0", -3 as "1", -3.05 as "0.95", -4 as "0".
+
+* Starting points:
+* * For some reason the original implementation uses normal distribution centred at 0, instead of uniform. I'm not sure if there is any benefit to this! In fact, intuition says maybe there is a draw back - we want even coverage of the space so it should be uniform!

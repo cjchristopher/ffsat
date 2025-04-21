@@ -12,7 +12,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from jax.typing import ArrayLike as Array
-from jaxopt import ProjectedGradient  # , ProximalGradient
+from jaxopt import ProjectedGradient, LBFGSB  # , ProximalGradient
 from jaxopt.projection import projection_box
 from tqdm import tqdm
 
@@ -27,7 +27,8 @@ jax.config.update('jax_enable_checks', True)
 
 @jax.jit
 def fval_one(x: Array, objective: Objective, weight: Array) -> Array:
-    lits, sign, _, _, _ = objective.clauses
+    lits = objective.clauses.lits
+    sign = objective.clauses.sign
     dft, idft = objective.ffts
     forward_mask = objective.forward_mask
     assignment = sign * x[lits]
@@ -41,7 +42,8 @@ def fval_one(x: Array, objective: Objective, weight: Array) -> Array:
 
 @jax.jit
 def fval_one_instrumented_sparse(x: Array, objective: Objective, weight: Array) -> Array:
-    _, sign, _, onehot, _ = objective.clauses
+    onehot = objective.clauses.sparse
+    sign = objective.clauses.sign
     dft, idft = objective.ffts
     forward_mask = objective.forward_mask
 
@@ -132,7 +134,7 @@ def verify_sparse(
             (jnp.sum(unsats_cnf(x0, cnf.clauses.sparse, cnf.clauses.sign, cnf.clauses.mask))),
             (jnp.sum(unsats_eo(x0, eo.clauses.sparse, eo.clauses.sign, eo.clauses.mask))),
             (jnp.sum(unsats_nae(x0, nae.clauses.sparse, nae.clauses.sign, nae.clauses.mask))),
-            (jnp.sum(unsats_card(x0, card.clauses.sparse, card.clauses.sign, card.clauses.mask, card.cards))),
+            (jnp.sum(unsats_card(x0, card.clauses.sparse, card.clauses.sign, card.clauses.mask, card.clauses.cards))),
             (jnp.sum(unsats_amo(x0, amo.clauses.sparse, amo.clauses.sign, amo.clauses.mask))),
         ]
     )
@@ -208,7 +210,7 @@ def verify(
             (jnp.sum(unsats_cnf(x0, cnf.clauses.lits, cnf.clauses.sign, cnf.clauses.mask))),
             (jnp.sum(unsats_eo(x0, eo.clauses.lits, eo.clauses.sign, eo.clauses.mask))),
             (jnp.sum(unsats_nae(x0, nae.clauses.lits, nae.clauses.sign, nae.clauses.mask))),
-            (jnp.sum(unsats_card(x0, card.clauses.lits, card.clauses.sign, card.clauses.mask, card.cards))),
+            (jnp.sum(unsats_card(x0, card.clauses.lits, card.clauses.sign, card.clauses.mask, card.clauses.cards))),
             (jnp.sum(unsats_amo(x0, amo.clauses.lits, amo.clauses.sign, amo.clauses.mask))),
         ]
     )
@@ -240,12 +242,14 @@ def hj_moreau_prox(x: Array, hyperparams: Any | None = None, scaling: float = 1)
 def run_solver(
     tasks: int, n_vars: int, n_clause: int, batch: int, objs: tuple[Objective, ...], vals: Validators
 ) -> float:
-    pg = ProjectedGradient(fun=fval, projection=projection_box, maxiter=50000)
+    pg = ProjectedGradient(fun=fval, projection=projection_box, maxiter=500)
+    bfgs = LBFGSB(fun=fval, maxiter=500, verbose=0)
     # prox = ProximalGradient(fun=fval, prox=hj_moreau_prox, maxiter=50000)
 
     def opt(x0: Array, objs: tuple[Objective, ...] = None, vals: Validators = None, weight: Array = None):
         # jax.debug.print("{}", x0)
-        x0, state = pg.run(x0, hyperparams_proj=(-1, 1), objs=objs, weight=weight)
+        #x0, state = pg.run(x0, hyperparams_proj=(-1, 1), objs=objs, weight=weight)
+        x0, state = bfgs.run(x0, bounds=(-1 * jnp.ones_like(x0), jnp.ones_like(x0)), objs=objs, weight=weight)
         # jax.debug.print("{}, {}", state, fval(x0, objs, weight))
         res = verify(x0, vals.xor, vals.cnf, vals.eo, vals.nae, vals.card, vals.amo)
         return x0, res, state.iter_num

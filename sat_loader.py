@@ -104,7 +104,7 @@ class Formula(object):
                                 card = (-1)**negate * (card + (not(negate^equality)))
                             first += 1  # new first literal position
                         else:
-                            card = None
+                            card = 0
 
                         # Collect literals
                         lits = [int(val) for val in split[first:-1]]  # drop trailing 0
