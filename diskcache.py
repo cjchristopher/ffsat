@@ -5,7 +5,8 @@ from typing import Any, Optional
 import numpy as np
 from jax.typing import ArrayLike as Array
 
-
+# TODO: Implement smart retrieval from disk of precomputed FFT matrices for (c_type, n, k) tuples. 
+# Required for meaningful deployment for fast preprocessing.
 class FFSATCache:
     """Unified caching system for FFSAT."""
 

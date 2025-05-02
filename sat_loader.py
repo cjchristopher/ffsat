@@ -55,7 +55,7 @@ class Formula(object):
 
         Note:
             The function assumes consistent formatting throughout the file. Files with
-            mixed format styles may not parse correctly.
+            mixed format styles will not parse correctly.
         """
         try:
             with open(dimacs_file, "r") as f:
@@ -99,17 +99,19 @@ class Formula(object):
                                 skip = negate + equality
                                 card = int(split[first][skip:])
                                 if card < 0:
-                                    print("Cardinality clause can't be an inequality against a negative cardinality")
+                                    print("ERROR: Card can't be inequality with negative cardinality", file=sys.stderr)
                                     raise ValueError
                                 card = (-1)**negate * (card + (not(negate^equality)))
                             first += 1  # new first literal position
                         else:
                             card = 0
 
-                        # Collect literals
                         lits = [int(val) for val in split[first:-1]]  # drop trailing 0
+                        n = len(lits)
+                        if card > n:
+                            print("ERROR: Cardinality claues with card > #lits (always UNSAT)", file=sys.stderr)
+                            raise ValueError
                         clause = Clause(clause_type, lits, card)
-                        n = len(clause.lits)
 
                         # Append clauses to relevant lists
                         self.clauses_type[clause_type].append(clause)
