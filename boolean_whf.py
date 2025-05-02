@@ -1,5 +1,5 @@
 import sys
-from typing import NamedTuple, Type
+from typing import NamedTuple
 from typing import Optional as Opt
 
 import jax.numpy as jnp
@@ -111,10 +111,9 @@ class ClauseGroup:
     @classmethod
     def _wf_coeff_nae(cls, n: int) -> Array:
         r"""Walsh-Fourier coefficients for not-all-equal (NAE) clauses.
-        For all even $$|S|$$, the coefficient at that size is $$(1/2)^{n-2}$$ due to cancellation
-        of all even terms in $$g(\rho)$$, and value $${n-1\choose |S|-1}$$ at all odd terms.
-        This cancels the denominator in the general equation, leaving a factor of 2.
-        This happens to essentially align with the $$|S|=0$$ case, but subtract 1. Hence:
+        For all even $$|S|$$, the coefficient at that size is $$(1/2)^{n-2}$$ due to cancellation of all even terms in $$g(\rho)$$,
+        and value $${n-1\choose |S|-1}$$ at all odd terms. This cancels the denominator in the general equation,
+        leaving a factor of 2. This happens to essentially align with the $$|S|=0$$ case, but subtract 1. Hence:
         """
         d = np.zeros(n + 1)
         d[::2] = 1 / (2 ** (n - 2))
@@ -150,43 +149,50 @@ class ClauseGroup:
     def _wf_coeff_card(cls, n: int, k: Opt[int] = None) -> Array:
         r"""Walsh-Fourier coefficients for cardinality clauses.
         This does not simplify to a clean closed form, so we require some manual computation.
-        The dominating step is polyfromroots, at $$O(n\cdot log^{2}(n))$$"""
+        The dominating step is polyfromroots, at $$O(n\cdot log^{2}(n))$$ for a clause of $$n$$ variables.
+        $$
+        \widehat{{\texttt{CARD}_{\geq k}}}(S) = \left\lbrace
+        \begin{aligned}
+            &1-\frac{\sum_{i=k}^{n}{n\choose i}}{2^{n-1}} & \abs{S} = 0 \\
+            &\frac{{n-1 \choose k-1}\left(g_{\texttt{CARD}}(\rho)\right)_{[p^{|S|-1}]}}{{n-1\choose |S|-1}2^{n-1}} & \abs{S} \neq 0
+        \end{aligned}\right.
+        $$
+        and $$ g_{\texttt{CARD}}(\rho) = (1+\rho)^{n-k}(1-\rho)^{k-1} $$
+        """
         negate = -1 if k < 0 else 1
         k = abs(k)
-
-        # Check valid $$n,k$$ - inform the user of poor encodings (although this won't affect CLS/FF-Sat solving time)
-
-        # Should never happen.
-        if k is None:
-            print("ERROR: Cardinality clause detected with no cardinality specified", file=sys.stderr)
-            raise TypeError
-
-        # e.g. clause is just CNF.
-        if k == 1:
-            print("WARNING: Detected CNF encoded as cardinality-1 clause", file=sys.stderr)
-            return cls._wf_coeff_cnf(n)
-
         d = np.zeros(n + 1)
-        # e.g. clause $$c = \texttt{CARD}^{\geq n}(x_1, x_2,\ldots, x_n)$$ is just $$FE_c = x_1 \land x_2 \land \ldots \land x_n$$
-        # if n == k:
-        #     print(f"WARNING: Detected {n} unit literals encoded as a cardinality-{n} clause", file=sys.stderr)
-        #     d[-1] = 1
-        #     return d
 
-        # e.g. clause $$c = \texttt{CARD}^{\geq 0}(x_1, x_2,\ldots)$$ is just $$FE_c = -1$$ (e.g. free assignment/dead clause)
-        if k == 0:
-            print("WARNING: Detected cardinality 0 clause", file=sys.stderr)
-            d[0] = -1
+        r"""For $$n=k$$, e.g. clause $$c = \texttt{CARD}^{\geq n}(x_1, x_2,\ldots, x_n)$$ is just $$c = x_1 \land x_2 \land \ldots \land x_n$$.
+        Then $$g_{\texttt{CARD}} = (1-\rho)^{n-1}$$. The coefficients are just the  $$(n-1)$$th row of Pascal's triangle, 
+        with every second term negated, or... $$(-1)^{|S|-1}{n-1 \choose |S|-1}$$, cancelling out.
+        This means we get a simplified form:
+        $$
+        \widehat{{\texttt{CARD}_{\geq k}}}(S) = \left\lbrace
+        \begin{aligned}
+            &1-\frac{1}{2^{n-1}} & \abs{S} = 0 \\
+            &\frac{(-1)^{|S|-1}}{2^{n-1}} & \abs{S} \neq 0
+        \end{aligned}\right.
+        $$
+        Having said this... there is merit to force reincoding this as n separate unit literals.
+        Notably those individual terms will be trivially minimisable. This form is distinctly not.
+        """
+        if n == k:
+            d = np.ones(n + 1) / (2 ** (n - 1))
+            d[::2] *= -1
+            d[0] += 1
             return d
 
-        # Calculate $$g(\rho) = (1+\rho)^{n-k}(1-\rho)^{k-1}$$ for given $$n,k$$
-        # Reform so all terms in p are zeroes of the poly (nb. $$(1-\rho) = -(\rho-1)$$)
-        # $$g(\rho) = (\rho+1)^{n-k}(\rho-1)^{k-1}(-1)^{k-1}$$
+        # # e.g. clause $$c = \texttt{CARD}^{\geq 0}(x_1, x_2,\ldots)$$ is just $$FE_c = -1$$ (always SAT)
+        # if k == 0:
+        #     d[0] = -1
+        #     return d
+
+        # Calculate $$g(\rho) = (1+\rho)^{n-k}(1-\rho)^{k-1}$$, and reformulate for zeroes: $$(1-\rho) = -(\rho-1)$$
+        # Therefore $$g(\rho) = (\rho+1)^{n-k}(\rho-1)^{k-1}(-1)^{k-1}$$, and then multiply by combinatoric term.
         noise_zeroes = np.array([-1] * (n - k) + [1] * (k - 1))
         noise_poly = np.polynomial.polynomial.polyfromroots(noise_zeroes)
         noise_poly *= (-1) ** ((k - 1) % 2)
-
-        # Full numerator expression: $${n-1\choose k-1} g(p)$$
         numerators = np.array(comb(n - 1, k - 1, exact=True) * noise_poly)
 
         # The denominator for each $$|S|$$ has a $${n-1 \choose |S|-1}$$ term. Since each subsequent term in the series can be expressed
@@ -199,7 +205,7 @@ class ClauseGroup:
         pascal_row = np.ones((m // 2) + 1, dtype=dtype)
         pascal_row[1:] = np.arange(1, (m // 2) + 1, dtype=dtype)
 
-        # Calculate the factorial numerator and denominators separately, and integer divide
+        # Calculate the factorial numerator and denominators separately, and integer divide for stability.
         # This implements the above recurrence for each subsequent term up to the midpoint of the triangle.
         pascal_denoms = np.cumprod(pascal_row[1:], dtype=dtype)
         np.cumprod((m + 1 - pascal_row[1:]), out=pascal_row[1:], dtype=dtype)
@@ -231,38 +237,76 @@ class ClauseGroup:
             return method_map[t](n, k)
         return method_map[t](n)
 
-    def _fft(self, clauses: list[Clause]) -> tuple[FFT, Array]:
+    def _fft(self, clauses: list[Clause]) -> tuple[FFT, Array, list[Clause]]:
         dfts = []
         idfts = []
+        del_list = []
+        unit_lits = set()
 
-        for clause in clauses:
+        for idx, clause in enumerate(clauses):
             t = clause.type
             n = len(clause.lits)
             k = clause.card
 
+            if t == "card":
+                # Flag, then correct or discard clauses that shouldn't be CARD.
+                if n == k:
+                    # flag for deletion, collect unit skips, and skip (handles the $$n=1$$ case)
+                    print(f"WARNING: Detected {n} unit literals encoded as a cardinality-{n} clause", file=sys.stderr)
+                    del_list.append(idx)
+                    for lit in clause.lits:
+                        unit_lits.add(lit)
+                    continue
+
+                if k == 0:
+                    print("WARNING: Detected cardinality 0 clause (trivially SAT)", file=sys.stderr)
+                    # flag for deletion and skip
+                    del_list.append(idx)
+                    continue
+
+                if k == 1:  # implicitly $$n>1$$ at this stage.
+                    # Change clause type if we aren't in a "CARD" specific clause group, very minor impact.
+                    print("WARNING: Detected CNF encoded as cardinality-1 clause", file=sys.stderr)
+                    if self.clause_type != "card":
+                        t = "cnf"
+                        k = 0
+                        clauses[idx] = Clause(type=t, lits=clause.lits, card=k)
+
+            elif n == 1:
+                # Single literal clause
+                print(f"WARNING: Detected unit literal as {t} clause", file=sys.stderr)
+                del_list.append(idx)
+                unit_lits.add(clause.lits[0])
+                continue
+
             if (t, n, k) in self.live_cache:
                 # fastest
-                dft, idft = self.live_cache[(t, n, k)]
+                fft = self.live_cache[(t, n, k)]
             elif (t, n, k) in self.disk_cache:
                 # check if computed in disk cache
-                dft, idft = self.disk_cache[(t, n, k)]
-                self.live_cache[(t, n, k)] = (dft, idft)
+                fft = self.disk_cache[(t, n, k)]
+                self.live_cache[(t, n, k)] = fft
             else:
                 # manual compute using closed form FWH Coefficients. 1/n applied to idft.
-                dft: Array = dft_table(n + 1)
                 coeff = self._wf_coeff(t, n, k)
+                dft: Array = dft_table(n + 1)
                 idft = coeff[::-1] @ np.conjugate(dft) / (n + 1)
                 dft = dft[1].reshape(n + 1, 1)
-                self.live_cache[(t, n, k)] = (dft, idft)
+                fft = FFT(dft, idft)
+                # update cachecs
+                self.live_cache[(t, n, k)] = fft
                 if isinstance(self.do_fft, FFSATCache):
-                    self.do_fft.put((t, n, k), (dft, idft))
+                    self.do_fft.put((t, n, k), fft)
 
-            dfts.append(dft)
-            idfts.append(idft)
+            dfts.append(fft.dft)
+            idfts.append(fft.idft)
+
+        for clause_idx in sorted(del_list, reverse=True):
+            clauses.pop(clause_idx)
 
         dfts, dfts_mask = [jnp.array(arr) for arr in self._pad(dfts)]
         idfts = jnp.array(self._pad(idfts)[0])
-        return (dfts, idfts), dfts_mask
+        return fft, dfts_mask, unit_lits
 
     def _pad(self, arrays: list[Array | list[int]], pad_val: Opt[int] = 0) -> tuple[Array, Array]:
         arrays = [np.array(arr) if isinstance(arr, list) else arr for arr in arrays]
@@ -293,28 +337,20 @@ class ClauseGroup:
         return padded, mask
 
     def process(self) -> None:
+        unit_lits = None
+        if self.do_fft:
+            self.ffts, dft_mask, unit_lits = self._fft(self.clauses)
         self.clause_array = self._to_array(self.clauses)
         if self.do_fft:
-            self.ffts, dft_mask = self._fft(self.clauses)
-            # Broadcast extra dim for correct outer addition result shape=(k,n+1,n)
+            # Get mask. Broadcast extra dim for correct outer addition result shape=(k,n+1,n)
             self.dft_mask = dft_mask & self.clause_array.mask[:, None, :]
+            # TODO:
             # if self.update_diskcache:
             #     self._update_diskcache()
+        return unit_lits
 
     def get(self) -> Objective:
         if self.do_fft:
-            return Objective(clauses = self.clause_array, ffts=self.ffts, forward_mask=self.dft_mask)
+            return Objective(clauses=self.clause_array, ffts=self.ffts, forward_mask=self.dft_mask)
         else:
-            return Objective(clauses = self.clause_array)
-
-
-# Create a function factory for backward compatibility with existing code
-def create_clause_group(clause_type: str) -> Type[ClauseGroup]:
-    """Factory function that returns a ClauseGroup class specialized for a specific clause type."""
-
-    class SpecializedClauseGroup(ClauseGroup):
-        def __init__(self, clauses: list[Clause], n_var: int, do_fft: bool = True, fft_cache: Opt[str] = None):
-            super().__init__(clauses, n_var, do_fft, fft_cache, clause_type=clause_type)
-
-    SpecializedClauseGroup.__name__ = f"{clause_type.capitalize()}Clauses"
-    return SpecializedClauseGroup
+            return Objective(clauses=self.clause_array)

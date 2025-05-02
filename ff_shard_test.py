@@ -1,13 +1,22 @@
 import os
+import sys
+
+import jax.core
 
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"  # Disable pre-allocation
-os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"  # Use platform-specific allocator
-os.environ["XLA_FLAGS"] = (
-    "--xla_gpu_triton_gemm_any=true --xla_gpu_enable_latency_hiding_scheduler=true --xla_gpu_enable_highest_priority_async_stream=true"
+# os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"  # Use platform-specific allocator
+os.environ["XLA_FLAGS"] = " ".join(
+    [
+        "--xla_gpu_triton_gemm_any=true",
+        "--xla_gpu_enable_latency_hiding_scheduler=true",
+        "--xla_gpu_enable_highest_priority_async_stream=true",
+    ]
 )
 
+import logging
 from argparse import ArgumentParser as ArgParse
 from collections.abc import Callable
+from contextlib import nullcontext
 from time import perf_counter as time
 from typing import Optional as Opt
 
@@ -25,9 +34,26 @@ from boolean_whf import Objective, class_idno
 from sat_loader import Formula
 from utils import preprocess_to_matrix
 
+jax.config.update("jax_compilation_cache_dir", "/tmp/jax-cache")
+jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
+jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
+# jax.config.update("jax_persistent_cache_enable_xla_caches", "all")
+#jax.config.update("jax_explain_cache_misses", True)
 jax.config.update("jax_enable_x64", True)
 jax.config.update("jax_enable_checks", True)
 # jax.config.update("jax_disable_jit", True)
+
+
+# fh = logging.FileHandler(filename="jax.log")
+# fh.setLevel(logging.DEBUG)
+# logging.basicConfig(level=logging.INFO)
+# jaxlog = logging.getLogger("jax")
+# # Remove any existing handlers
+# for handler in jaxlog.handlers[:]:
+#     jaxlog.removeHandler(handler)
+# jaxlog.setLevel(logging.DEBUG)
+# jaxlog.addHandler(fh)
+# jaxlog.propagate = False
 
 
 def shard_objective(obj: Objective, clause_sharding: NamedSharding) -> Objective:
@@ -65,9 +91,13 @@ def eval_verify(objs: tuple[Objective, ...], combined: bool) -> tuple[Callable, 
                 - verify_batch (Callable[[Array], Array]): Verifies the satisfaction of all
                   objectives for a batch of assignments.
     """
+    print(
+        f"TRACING full eval constructor ({combined}) with shapes: {[w.shape for obj in objs for w in obj.clauses if w is not None]}"
+    )
 
     # Construct JAX sharded evaluator and verifier
     def single_eval_verify(obj: Objective) -> tuple[Callable[[Array], Array], ...]:
+        print(f"TRACING single obj eval constructor with shapes: {[w.shape for w in obj.clauses if w is not None]}")
         lits = obj.clauses.lits
         sign = obj.clauses.sign
         mask = obj.clauses.mask
@@ -79,10 +109,13 @@ def eval_verify(objs: tuple[Objective, ...], combined: bool) -> tuple[Callable, 
         forward_mask = obj.forward_mask
 
         def evaluate(x: Array, weight: Array) -> Array:
+            print(f"TRACING evaluate with shapes: {x.shape}, {weight.shape}")
             assignment = sign * x[lits]
             prod = jnp.prod(dft + assignment[:, None, :], axis=2, where=forward_mask)
             clause_eval = jnp.sum(idft * prod, axis=1).real
-            cost = weight * clause_eval
+            # TODO: think about this
+            cost = jnp.where(clause_eval > 0, clause_eval * weight, clause_eval)
+            # cost = weight * clause_eval
             return jnp.sum(cost)
 
         def verify(x: Array) -> Array:
@@ -134,32 +167,59 @@ def eval_verify(objs: tuple[Objective, ...], combined: bool) -> tuple[Callable, 
     evaluators, verifiers = zip(*[single_eval_verify(obj) for obj in objs])
 
     def evaluate_all(x: Array, weights: list[Array]) -> tuple[Array, Array]:
+        print(f"TRACING evaluate_all with shapes: {x.shape}, {[w.shape for w in weights]}")
         costs = [eval_fn(x, weight) for (eval_fn, weight) in zip(evaluators, weights)]
         cost = jnp.sum(jnp.array(costs))
+        #jax.debug.print("xx: {}, {}, {}, {}", x.shape, x[:3], cost, costs)
+        # jax.core.
+        # if jax.core.cur_sublevel().name:
+        #     jax.debug.print("XX LOC: {}", jax.core.cur_sublevel().name)
         return cost, cost  # aux info
-
-    def evaluate_batch(xB: Array, weights: list[Array]) -> Array:
-        # def eval_single(x):
-        #     return evaluate_all(x, weights)
-        # batch_eval, _ = jax.lax.map(eval_single, xB)
-        batch_eval, _ = jax.vmap(evaluate_all, in_axes=(0, None))(xB, weights)
-        return jnp.mean(batch_eval), batch_eval
 
     def verify_all(x: Array) -> Array:
         all_res = [res_fn(x) for res_fn in verifiers]
         res = jnp.concat(all_res)
         return res
 
+    if not combined:
+        print("Returning single vector versions")
+        return evaluate_all, verify_all
+
+    def evaluate_batch(xB: Array, weights: list[Array]) -> Array:
+        print(f"TRACING evaluate_batch with shapes: {xB.shape}, {[w.shape for w in weights]}")
+        # def eval_single(x):
+        #     return evaluate_all(x, weights)
+        # batch_eval, _ = jax.lax.map(eval_single, xB)
+        batch_eval, _ = jax.vmap(evaluate_all, in_axes=(0, None))(xB, weights)
+        # #jax.debug.print("Batch scores: {} | Mean: {}", batch_eval, jnp.mean(batch_eval), )
+        # TODO: It's not clear that mean is the best here.
+        return jnp.mean(batch_eval), batch_eval
+
     def verify_batch(xB: Array) -> Array:
         batch_res = jax.vmap(verify_all)(xB)
         return batch_res
 
-    if not combined:
-        return evaluate_all, verify_all
-
+    print("Returning batch versions")
     return evaluate_batch, verify_batch
 
 
+# TODO: Enable solver switching based on command line.
+def solver_config(solver: str, eval_fun: Callable):
+    match solver:
+        case "lbfgsb":
+            return LBFGSB(fun=eval_fun, maxiter=500, has_aux=True)
+        case "pgd":
+            return ProjectedGradient(fun=eval_fun, projection=projection_box, maxiter=50, has_aux=True)
+        case "prox":
+            return ProximalGradient()
+
+
+# TODO: Enable starting point selection strategies on command line (will subsume vertex start and fuzzing)
+def next_x0_strategy():
+    pass
+
+
+# TODO: Add "solver" and "selection" params? For now L-BFGS-B is the best anyway.
 def run_solver(
     timeout: int,
     n_vars: int,
@@ -171,6 +231,8 @@ def run_solver(
     v_start: bool = False,
 ) -> float:
     # Create device mesh, declare JAX specs, and shard:
+    tsolver = time()
+    #print("Solver Init", file=sys.stderr)
     devices = jax.devices("gpu")
     gpu_batch = batch_sz * len(devices)
     weights = [jnp.ones_like(obj.clauses.types) for obj in objs]
@@ -180,94 +242,200 @@ def run_solver(
 
     best_unsat = jnp.inf
     best_x = None
-    best_start = None
+    # best_start = None
 
-    # all_x0 = []
-    # all_unsat = []
     all_iters = []
     all_unsat_cts = []
     starts = 0
     restart_ct = 0
     key = jax.random.PRNGKey(restart_ct)
     fuzz_key = jax.random.PRNGKey(restart_ct + 1)
+    timeout_m, timeout_s = divmod(timeout, 60)
+    #print("Complete Init", time() - tsolver, file=sys.stderr)
     t0 = time()
 
     with mesh:
+        #print("Before shardings", time() - tsolver, file=sys.stderr)
         clause_sharding = NamedSharding(mesh, shard_spec)
         sharded_objs = tuple(shard_objective(obj, clause_sharding) for obj in objs)
         sharded_weight = [jax.device_put(weight, clause_sharding) for weight in weights]
+        #print("After shardings", time() - tsolver, file=sys.stderr)
 
         def process_batch(x_batch: Array, weights: list[Array]) -> tuple[Array, Array, Array, Array]:
+            print(
+                f"TRACING process_batch at time {time() - t0:.2f}s with shapes: {x_batch.shape}, {[w.shape for w in weights]}"
+            )
             evaluator, verifier = eval_verify(sharded_objs, opt_combined)
-
-            pg = ProjectedGradient(fun=evaluator, projection=projection_box, maxiter=50, has_aux=True)
-            # bfgs = LBFGSB(fun=evaluator, maxiter=50, has_aux=True)
+            # TODO: Set solver and .run args as well somehow.
+            solver = solver_config("lbfgsb", evaluator)  # lbfgsb, pgd
 
             def optimize(x: Array) -> tuple[Array, Array, Array]:
-                x_opt, state = pg.run(x, hyperparams_proj=(-1, 1), weights=weights)
-                # x_opt, state = bfgs.run(x, bounds=(-1 * jnp.ones_like(x), jnp.ones_like(x)), weights=weights)
+                print(f"TRACING optimize with shapes: {x.shape}")
+                # x_opt, state = solver.run(x, hyperparams_proj=(-1, 1), weights=weights) #PDG
+                #jax.debug.print(
+                #     "Combined?: {} | x_shard shape: {} | dtype: {} | min: {} | max: {} | mean: {}",
+                #     opt_combined,
+                #     x.shape,
+                #     x.dtype,
+                #     jnp.min(x),
+                #     jnp.max(x),
+                #     jnp.mean(x),
+                # )
+                x_opt, state = solver.run(
+                    x, bounds=(-1 * jnp.ones_like(x), jnp.ones_like(x)), weights=weights
+                )  # L-BFGS-B
                 unsat = jnp.squeeze(verifier(x_opt))
-                return x_opt, unsat, jnp.atleast_1d(state.iter_num)
+                #jax.debug.print(
+                #     "AO Batch scores: {} | Mean: {} | Steps: {}", state.aux, jnp.mean(state.aux), state.iter_num
+                # )
+                return x_opt, unsat, jnp.atleast_1d(state.iter_num), state.aux
 
             if not opt_combined:
-                optimize_batch = jax.vmap(optimize)
+                print("VMAP optimize")
+                optimize_batch = jax.vmap(optimize, in_axes=(0,))
+                # x_shard = x_batch
                 x_shard = jax.lax.with_sharding_constraint(x_batch, clause_sharding)
             else:
+                print("JIT optimize")
                 optimize_batch = jax.jit(optimize)
                 x_shard = x_batch
-            x_opt, unsat, iters = optimize_batch(x_shard)
-            unsat_cl_count = jnp.sum(unsat, axis=0)
-            return x_opt, jnp.sum(unsat, axis=1), iters, unsat_cl_count
 
-        if not opt_combined:
-            opt_batch = jax.jit(process_batch, in_shardings=(clause_sharding, [clause_sharding] * len(weights)))
-        else:
-            opt_batch = jax.jit(process_batch, in_shardings=(None, [clause_sharding] * len(weights)))
+            print(f"TRACING process_batch finished {time() - t0:.2f}s")
+            print(f"TRACING x_shard {x_shard.shape}")
+            #jax.debug.print("First few values of x_shard: \n{}", x_shard[:, :3])
+            if not opt_combined:
+                t_res, _ = jax.vmap(evaluator, in_axes=(0, None))(x_batch, weights)
+                #jax.debug.print("Initial Evals:\n{}\n{}", jnp.mean(t_res), t_res)
+            else:
+                t_res, t_list = evaluator(x_batch, weights)
+                #jax.debug.print("Initial Evals:\n{}\n{}", t_res, t_list)
+
+            x_opt, unsat, iters, eval_scores = optimize_batch(x_shard)
+            #jax.debug.print("{}", unsat.shape)
+            unsat_cl_count = jnp.sum(jnp.atleast_1d(unsat), axis=0)
+            return x_opt, unsat, iters, unsat_cl_count, eval_scores
+
+        #print("JIT the whole thing", time() - tsolver, file=sys.stderr)
+        opt_batch = jax.jit(process_batch, in_shardings=(None, [clause_sharding] * len(weights)))
+        #print("JITTED", time() - tsolver, file=sys.stderr)
 
         batch_time = t0
         pbar = tqdm(
             total=timeout,
             desc=f"restart {restart_ct} ({starts}/{restart} -- best={best_unsat})",
-            bar_format="{l_bar}{bar}| {elapsed}s/{total}s",
+            bar_format="{l_bar}{bar}| {elapsed}/" + str(timeout_m).zfill(2) + ":" + str(timeout_s).zfill(2),
         )
         while time() - t0 < timeout:
-            x0 = jax.random.uniform(key, minval=-1.0, maxval=1.0, shape=(gpu_batch, n_vars))
-            fuzz = jax.random.uniform(fuzz_key, minval=1e-10, maxval=1e-4, shape=x0.shape)
+            fh = logging.FileHandler(filename="jax_{}_{}.log".format(restart_ct, starts))
+            # Remove any existing handlers
+            # for handler in jaxlog.handlers[:]:
+            #     jaxlog.removeHandler(handler)
+            # jaxlog.addHandler(fh)
+
+            tloop = time()
+            #print("##### New Loop start || elapsed since call to run:", tloop - tsolver, file=sys.stderr)
+            key, subkey = jax.random.split(key)
+            fuzz_key, subfuzz_key = jax.random.split(fuzz_key)
+
+            sample_method = "uniform"  # or 'bias' or 'coin' (weighted benoulli coin)
+
+            match sample_method:
+                case "bias":
+                    # Generate values biased towards 1 (False) while maintaining full [-1, 1] range
+                    # Method 1: Using power transformation with bias_strength (original)
+                    u = jax.random.uniform(subkey, minval=0.0, maxval=1.0, shape=(gpu_batch, n_vars))
+                    bias_strength = 0.5  # Lower value = stronger bias towards 1 (values 0-1)
+                    x0 = 2 * u**bias_strength - 1
+                case "coin":
+                    # Method 2: Using a biased coin flip (Bernoulli distribution)
+                    # Uncomment to use this method instead
+                    false_prob = 0.7  # Y% probability of generating values tending towards False
+                    coin_key, subkey = jax.random.split(subkey)
+                    biased_coins = jax.random.bernoulli(coin_key, p=false_prob, shape=(gpu_batch, n_vars))
+                    signs = 2 * biased_coins - 1  # Convert to -1/1
+                    magnitudes = jax.random.uniform(subkey, minval=0.0, maxval=1.0, shape=(gpu_batch, n_vars))
+                    x0 = signs * magnitudes
+                case "uniform" | _:
+                    x0 = jax.random.uniform(subkey, minval=-1, maxval=1, shape=(gpu_batch, n_vars))
+
+            fuzz = jax.random.uniform(subfuzz_key, minval=1e-10, maxval=1e-4, shape=x0.shape)
             fuzz_attempt = 0
 
             if v_start:
                 # snap to nearest vertex and fuzz to avoid immediate saddle
                 x0 = jnp.sign(x0)
                 x0 = x0 + -x0 * fuzz
-            x_starts = x0[:]
+            # x_starts = x0[:]
+            #print("Random keys regen & snap", time() - tloop, file=sys.stderr)
 
             # Do it.
-            opt_x0, opt_unsat, opt_iters, opt_unsat_ct = opt_batch(x0, sharded_weight)
-
-            batch_best = jnp.min(opt_unsat)
+            #print("Before OPT call", time() - tloop, file=sys.stderr)
+            # with jax.profiler.trace(f"/tmp/jax-trace-restart-{restart_ct}", create_perfetto_link=True):
+            #     opt_x0, opt_unsat, opt_iters, opt_unsat_ct, eval_scores = opt_batch(x0, sharded_weight)
+            print(x0.shape)
+            opt_x0, opt_unsat, opt_iters, opt_unsat_ct, eval_scores = opt_batch(x0, sharded_weight)
+            #print("After OPT call", time() - tloop, file=sys.stderr)
+            batch_unsat_scores = jnp.sum(jnp.atleast_2d(opt_unsat), axis=1)
+            print("unsat scores:", batch_unsat_scores, "\n eval scores:", eval_scores)
+            batch_best = jnp.min(batch_unsat_scores)
+            print("eval of best score:", batch_best, jnp.max(jnp.abs(eval_scores)))
             best_unsat = batch_best if batch_best < best_unsat else best_unsat
+            #print("After some JNP + maybe fuzz next", time() - tloop, file=sys.stderr)
 
             found_sol = False
             if batch_best == 0:
                 print("Found a solution!")
                 found_sol = True
+
             elif fuzz_limit:
+                xF = opt_x0[:]
                 # Solution not found - fuzz current convergence.
+                print("BEFORE:", opt_x0[0][:5])
+                fuzz_key, subfuzz_key = jax.random.split(fuzz_key)
+                fuzz = jax.random.uniform(subfuzz_key, minval=1e-7, maxval=1e-2, shape=x0.shape)
+                fuzz_mag = 1
                 while fuzz_attempt < fuzz_limit:
                     fuzz_attempt += 1
-                    xF = opt_x0 + -jnp.sign(opt_x0) * fuzz * 100
-                    opt_xF, opt_unsatF, opt_itersF, opt_unsat_ctF = opt_batch(xF, sharded_weight)
-                    batch_bestF = jnp.min(opt_unsatF)
+                    xFC = xF[:]
+                    flip = xF + fuzz**(1/fuzz_mag)
+                    flip = (jnp.abs(flip) > 1)
+                    #fuzz = jnp.where(flip, -fuzz, fuzz)
+                    #xF = xF + -jnp.sign(xF) * fuzz**fuzz_mag
+                    fuzz = (jnp.sign(fuzz)*jnp.abs(fuzz)**(1/fuzz_mag))
+                    print(fuzz[0][0:5])
+                    xF = jnp.clip(xF + fuzz, -1, 1)
+                    print(f"FUZZ {fuzz_mag}:", xF[0][:5])
+                    #print("Before OPT+FUZZ call", time() - tloop, file=sys.stderr)
+                    opt_xF, opt_unsatF, opt_itersF, opt_unsat_ctF, eval_scoresF = opt_batch(xF, sharded_weight)
+                    #print("After OPT+FUZZ call", time() - tloop, file=sys.stderr)
+                    batch_unsatF_scores = jnp.sum(jnp.atleast_2d(opt_unsatF), axis=1)
+                    batch_bestF = jnp.min(batch_unsatF_scores)
+                    #print("JNP stuff on FUZZ results", time() - tloop, file=sys.stderr)
                     if batch_bestF < best_unsat:
                         best_unsat = batch_bestF
-                        opt_x0, opt_unsat, opt_iters, opt_unsat_ct = opt_xF, opt_unsatF, opt_itersF, opt_unsat_ctF
+                        opt_x0, opt_unsat, opt_iters, opt_unsat_ct = xF, opt_unsatF, opt_itersF, opt_unsat_ctF
                     if batch_bestF == 0:
                         print(f"Fuzz {fuzz_attempt} found a solution!")
                         found_sol = True
                         break
+                    if (jnp.sign(xFC) == jnp.sign(opt_xF)).all():
+                        print("INCREASE MAGNITUDE", file=sys.stderr)
+                        fuzz_mag += 1
+                    else:
+                        mymask = jnp.nonzero(jnp.sign(xFC) != jnp.sign(opt_xF))
+                        fnz = (mymask[0][0],mymask[1][0])
+                        print(f"diff at pos {fnz}, start {xFC[fnz]} + fuzz {fuzz[fnz]} = {xF[fnz]}. Descended to {opt_xF[fnz]}")
+                        fuzz_mag = 1
+                    xF = opt_xF
+                    #print(f"Optim Iters: min: {jnp.min(opt_itersF)}, max: {jnp.max(opt_itersF)}, mean: {jnp.mean(opt_itersF)}")
+            #print(fuzz_limit, "Fuzz complete", time() - tloop, file=sys.stderr)
 
-            loc = jnp.argmin(opt_unsat)
+            loc = jnp.argmin(batch_unsat_scores)
             best_x = opt_x0[loc]
+            best_unsat_clause_idx = jnp.nonzero(jnp.atleast_2d(opt_unsat)[loc])
+            #print("Stats gather", time() - tloop, file=sys.stderr)
+            # clauses = {}
+            # for
             # best_start = x_starts[loc]
             # best_iters = opt_iters[loc]
 
@@ -286,12 +454,18 @@ def run_solver(
                         assignment.append(lit)
                 print(out_string)
                 stamp = time()
+                print(f"Optim Iters: min: {jnp.min(opt_iters)}, max: {jnp.max(opt_iters)}, mean: {jnp.mean(opt_iters)}")
+                print(opt_iters, eval_scores, opt_unsat, opt_x0[-3])
                 break
+            print(f"Optim Iters: min: {jnp.min(opt_iters)}, max: {jnp.max(opt_iters)}, mean: {jnp.mean(opt_iters)}")
 
             all_iters.append(opt_iters)
             all_unsat_cts.append(opt_unsat_ct)
             starts += gpu_batch
             if starts >= restart:
+                #break
+                #print("Performing restart", time() - tloop, file=sys.stderr)
+                #print("Memory before restart:", jax.devices()[0].memory_stats(), file=sys.stderr)
                 # Statistics for this restart
                 iters = jnp.concat(all_iters)
                 unsat_ct = jnp.array(all_unsat_cts)
@@ -307,23 +481,35 @@ def run_solver(
                 print(f"Optim Iters: min: {jnp.min(iters)}, max: {jnp.max(iters)}, mean: {jnp.mean(iters)}")
                 print(f"Restarts: {restart_ct} | Current  (#unsat): {best_unsat}")
 
-                punishment = unsat_ct.sum(axis=0)
-                p_start = 0
+                penalty = unsat_ct.sum(axis=0)
+                worst = penalty.max()
+
+                print(
+                    f"Unsat counts: {penalty}, Objs: {[obj.clauses.lits.shape for obj in objs]}, Best: {best_unsat_clause_idx}"
+                )
+                pen_start = 0
+                # adjust to always target -k?
                 for idx, weight in enumerate(weights):
                     n_clause = len(weight)
-                    p_end = p_start + n_clause
-                    weights[idx] = 0.9 * weight + 0.1 * punishment[p_start:p_end] / punishment.max()
-                    p_start += n_clause
-                sharded_weight = [jax.device_put(weight, clause_sharding) for weight in weights]
+                    pen_end = pen_start + n_clause
+                    w_pens = penalty[pen_start:pen_end]
+                    adj_weight = jnp.where(w_pens > 0, weight + 0.1 * w_pens / worst, 1)
+                    sharded_weight[idx] = jax.device_put(adj_weight, clause_sharding)
+                    pen_start += n_clause
+                tx = time()
+                #print(time() - tx, "SEP time to reload weights", file=sys.stderr)
 
                 stamp = time()
                 print("Restart time: {:.2f}/{}".format(stamp - t0, timeout))
+                #print("Memory after restart:", jax.devices()[0].memory_stats(), file=sys.stderr)
+                #print("Restart complete", time() - tloop, file=sys.stderr)
 
             pbar.set_description(f"restart {restart_ct} ({starts}/{restart} -- best={best_unsat})")
             pbar.update(time() - batch_time)
             batch_time = time()
+            #print("end loop", time() - tloop, file=sys.stderr)
         pbar.close()
-    return stamp - t0
+    return time() - t0
 
 
 def main(
@@ -383,9 +569,6 @@ if __name__ == "__main__":
     args = ap.parse_args()
 
     # Run with or without profiler based on the flag
-    print("Running with args:", args.mode, args.timeout, args.batch, args.restart, args.fuzz, args.combine)
-    if args.profile:
-        with jax.profiler.trace("/tmp/jax-trace", create_perfetto_link=True):
-            main(args.file, args.mode, args.timeout, args.batch, args.restart, args.fuzz, args.combine, args.vertex)
-    else:
+    profiler = jax.profiler.trace("/tmp/jax-trace", create_perfetto_link=True) if args.profile else nullcontext()
+    with profiler:
         main(args.file, args.mode, args.timeout, args.batch, args.restart, args.fuzz, args.combine, args.vertex)

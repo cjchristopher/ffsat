@@ -1,12 +1,13 @@
 # Uncomment if you need to inspect precise memory allocation/movements
-# import os
-# os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"  # Disable pre-allocation
-# os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"  # Use platform-specific allocator
+import os
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"  # Disable pre-allocation
+#os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"  # Use platform-specific allocator
 
 import argparse
 from time import perf_counter as time
 from typing import Any, Iterable
 from typing import Optional as Opt
+from contextlib import nullcontext
 
 import jax
 import jax.numpy as jnp
@@ -22,11 +23,13 @@ from utils import Validators, preprocess_to_matrix
 
 jax.config.update("jax_enable_x64", True)
 jax.config.update('jax_enable_checks', True)
-# jax.config.update("jax_disable_jit", True)
+jax.config.update("jax_disable_jit", True)
 
 
 @jax.jit
 def fval_one(x: Array, objective: Objective, weight: Array) -> Array:
+    #jax.debug.print("FVAL: {}, {}, {}, {}", jnp.min(x), jnp.max(x), x[99:102], x[:5])
+    #x = jnp.clip(x, -1, 1)
     lits = objective.clauses.lits
     sign = objective.clauses.sign
     dft, idft = objective.ffts
@@ -37,6 +40,18 @@ def fval_one(x: Array, objective: Objective, weight: Array) -> Array:
     prod = jnp.prod(dft + assignment[:, None, :], axis=2, where=forward_mask)
     clause_eval = jnp.sum(idft * prod, axis=1).real
     cost = weight * clause_eval
+    #jax.debug.print("A COST: {}, {}, {}, {}, {}", cost[101], lits[101], assignment[101], x[99:102], x.shape)
+    # def truefun():
+    #     pos = jnp.argmax(cost)
+    #     maxx = jnp.argmax(assignment[pos])
+    #     point_high = x[lits[pos][maxx]]
+    #     minx = jnp.argmin(assignment[pos])
+    #     point_low = x[lits[pos][minx]]
+    #     #jax.debug.print("{}, {}, {}, {}, {}", cost[pos], lits[pos], x[lits[pos]], jnp.sum(idft[pos]*prod[pos]).real, jnp.sum((idft[pos] * prod[pos]).real))
+    #     jax.debug.print("COST: {}, {}, {}, {}, {}, {}, {}", cost[pos], pos, jnp.max(jnp.abs(assignment[pos])), lits[pos], x[lits[pos]], jnp.min(x), jnp.max(x))
+    # def falsefun():
+    #     pass
+    # jax.lax.cond(jnp.sum(cost) > 500, truefun, falsefun)
     return jnp.sum(cost)
 
 
@@ -65,6 +80,7 @@ def fval(x: Array, objs: tuple[Objective, ...], weight: Array) -> Array:
     for objective in objs:
         costs.append(fval_one(x, objective, weight))
         # costs.append(fval_one_instrumented_sparse(x, objective, weight))
+    #jax.debug.print("{}", jnp.sum(jnp.array(costs))
     return jnp.sum(jnp.array(costs))
 
 
@@ -204,6 +220,7 @@ def verify(
     #     + (jnp.sum(unsats_card(x0, card.clauses.lits, card.clauses.sign, card.clauses.mask, card.cards)))
     #     + (jnp.sum(unsats_amo(x0, amo.clauses.lits, amo.clauses.sign, amo.clauses.mask)))
     # )
+    jax.debug.print("In verify: {}", x0[0])
     unsat = jnp.array(
         [
             (jnp.sum(unsats_xor(x0, xor.clauses.lits, xor.clauses.sign, xor.clauses.mask))),
@@ -242,17 +259,17 @@ def hj_moreau_prox(x: Array, hyperparams: Any | None = None, scaling: float = 1)
 def run_solver(
     tasks: int, n_vars: int, n_clause: int, batch: int, objs: tuple[Objective, ...], vals: Validators
 ) -> float:
-    pg = ProjectedGradient(fun=fval, projection=projection_box, maxiter=500)
+    #pg = ProjectedGradient(fun=fval, projection=projection_box, maxiter=500)
     bfgs = LBFGSB(fun=fval, maxiter=500, verbose=0)
-    # prox = ProximalGradient(fun=fval, prox=hj_moreau_prox, maxiter=50000)
+    #prox = ProximalGradient(fun=fval, prox=hj_moreau_prox, maxiter=50000)
 
     def opt(x0: Array, objs: tuple[Objective, ...] = None, vals: Validators = None, weight: Array = None):
-        # jax.debug.print("{}", x0)
         #x0, state = pg.run(x0, hyperparams_proj=(-1, 1), objs=objs, weight=weight)
+        jax.debug.print("BEFORE OPT: {}, {}, {}, {}", jnp.min(x0), jnp.max(x0), x0[99:102], x0.shape)
         x0, state = bfgs.run(x0, bounds=(-1 * jnp.ones_like(x0), jnp.ones_like(x0)), objs=objs, weight=weight)
-        # jax.debug.print("{}, {}", state, fval(x0, objs, weight))
+        jax.debug.print("{}", state.iter_num)
         res = verify(x0, vals.xor, vals.cnf, vals.eo, vals.nae, vals.card, vals.amo)
-        return x0, res, state.iter_num
+        return x0, res, jnp.atleast_1d(state.iter_num)
 
     weight = 1  # jnp.ones(n_clause) # eventually objs.weight???
     v_opt = jax.jit(jax.vmap(opt, in_axes=(0, None, None, None), axis_name="batch"))
@@ -269,6 +286,9 @@ def run_solver(
     while time() - t0 < 300:
         key = jax.random.PRNGKey(tic)
         x0 = jax.random.truncated_normal(key, -1.0, 1.0, shape=(tasks, n_vars))
+        #x0 = jax.random.uniform(key, minval=-1.0, maxval=1.0, shape=(tasks, n_vars))
+        print(jnp.min(x0[0]), jnp.max(x0[0]), x0[0].shape, x0[0][:5])
+        print(x0[0][95:105])
         xInit = x0[:]
 
         # x0 = jnp.sign(xS) # start at vertices
@@ -294,22 +314,24 @@ def run_solver(
                 device_batches.append(x0[start_idx:end_idx])
             stacked_batches = jnp.stack(device_batches)
 
-            # stamp1 = time()
+            print("calling solver", stacked_batches.shape, stacked_batches)
+            stamp1 = time()
             batch_x0, batch_unsat, batch_iters = p_opt(stacked_batches, objs, vals, weight)
-            # stamp2 = time()
-            # print("returned to python after", stamp2 - stamp1)
+            stamp2 = time()
+            print("returned to python after", stamp2 - stamp1)
 
-            # Collect results
-            for d in range(n_gpu):
-                res_x0.append(batch_x0[d])
-                res_unsat.append(batch_unsat[d])
-                res_iters.append(batch_iters[d])
+            batch_x0 = jnp.concatenate(batch_x0)
+            batch_unsat = jnp.concatenate(batch_unsat)
+            batch_iters = jnp.concatenate(batch_iters)
+
+            res_x0.append(batch_x0)
+            res_unsat.append(batch_unsat)
+            res_iters.append(batch_iters)
 
             batch_best = jnp.min(jnp.sum(batch_unsat, axis=1))
             cumul_best = batch_best if batch_best < cumul_best else cumul_best
             if batch_best == 0:
-                print(batch_unsat)
-                print("count a cost 0????")
+                print("Found a SAT solution!")
                 break
             pbar.set_description("batches (best={})".format(cumul_best))
 
@@ -321,14 +343,6 @@ def run_solver(
         unsat = unsat.sum(axis=1)
         min_unsat = unsat.min()
         print("Restarts:", tic, "Best found unsat count:", min_unsat)
-
-        # This is essentially the number of jobs that got the clause wrong.
-        # Weight for a clause goes to zero if all got it right - contributes nothing to grad?
-        # Blow up the grad for a clause that many got wrong
-        # but starting at 1... then 0.9 + 0.1 * 1 = 0.1 = 1.... and eveything else is scaled back
-        # reward = unsat.sum(axis=0)
-        # weight = 0.9 * weight + 0.1 * reward / reward.max()
-        # unsat = weight * unsat
 
         if min_unsat < best_unsat:
             best_unsat = min_unsat
@@ -395,13 +409,7 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    # if "XLA_FLAGS" in os.environ:
-    #     print(os.environ["XLA_FLAGS"])
-    # else:
-    #     print("CHECK XLA FLAGS")
     # Run with or without profiler based on the flag
-    if args.profile:
-        with jax.profiler.trace("/tmp/jax-trace", create_perfetto_link=True):
-            main(args.file, args.tasks, args.batch, args.mode)
-    else:
+    profiler = jax.profiler.trace("/tmp/jax-trace", create_perfetto_link=True) if args.profile else nullcontext()
+    with profiler:
         main(args.file, args.tasks, args.batch, args.mode)

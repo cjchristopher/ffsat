@@ -7,7 +7,7 @@ from typing import Optional as Opt
 
 import typer
 
-from boolean_whf import ClauseGroup, Objective, class_idno, empty_validator
+from boolean_whf import Clause, ClauseGroup, Objective, class_idno, empty_validator
 from sat_loader import Formula
 
 
@@ -35,9 +35,9 @@ def preprocess_to_matrix(sat: Formula, mode: Opt[int], threshold: int = 0) -> tu
         print("Please see the following clause type and clause length breakdowns and select an option:")
         print(
             "Types count:\n\t",
-            [f"{x}: {len(y)} ({sat.stats[x]})" for (x, y) in sat.clauses_type.items() if y],
+            [f"{x}: {len(y)} (length counts - {sat.stats[x]})" for (x, y) in sat.clauses_type.items() if y],
         )
-        print("Lengths count\n\t", [f"{x}: {len(y)}" for (x, y) in sat.clauses_len.items()])
+        print("Lengths counts\n\t", [f"len {x}: {len(y)} clauses" for (x, y) in sat.clauses_len.items()])
         print(
             "\tOptions:\n"
             + "\t\t1: Full combine. Use single monolithlic array with all clauses appropriately padded\n"
@@ -48,6 +48,8 @@ def preprocess_to_matrix(sat: Formula, mode: Opt[int], threshold: int = 0) -> tu
 
     n_var = sat.n_var
     # We need the breakdown by clause type anyway for quick validation.
+    # TODO: No longer required - left for backwards compatibility with the unsharded code.
+    # Once unsharded is factored, this first loop should become the last block in the match/case below.
     for c_type, c_list in sat.clauses_type.items():
         if c_list:
             # Clauses present, do FFTs if user partition choice was by type.
@@ -67,22 +69,35 @@ def preprocess_to_matrix(sat: Formula, mode: Opt[int], threshold: int = 0) -> tu
             # type already proesssed above.
             pass
 
-    # Process groups!
+    # Process groups (in parallel).
     def process_groups(clause_grps: dict[str, ClauseGroup], max_workers: Opt[int] = None):
         def process(grp: ClauseGroup):
-            grp.process()
+            aux_grp = grp.process()
+            return aux_grp
 
         with ThreadPoolExecutor(max_workers=max_workers) as tpool:
             tasks = [tpool.submit(process, grp) for grp in clause_grps.values() if grp]
+            res = []
             for task in tasks:
-                task.result()
+                res.append(task.result())
 
-    process_groups(clause_grps, max_workers=min(len(clause_grps), 8))
+        # Collect detected unit literals
+        lits = set()
+        for r in res:
+            if r is not None:
+                lits.update(r)
+        if lits:
+            unit_lits = [Clause("cnf", [lit], 0) for lit in lits]
+            unit_lits = ClauseGroup(unit_lits, len(unit_lits), do_fft=True, clause_type="cnf")
+            unit_lits.process()
+            return [unit_lits]
+        return []
 
+    objectives = process_groups(clause_grps, max_workers=min(len(clause_grps), 8))
     empty_Validation = empty_validator(n_var)
-    objectives = []
     validation = {}
 
+    # TODO: As above, separate validation no longer required, but left for compat with unsharded.
     for grp_type, grp in clause_grps.items():
         if not grp:
             # No clause set, so in clause_grps for validation, add the empty.
@@ -103,6 +118,7 @@ def preprocess_to_matrix(sat: Formula, mode: Opt[int], threshold: int = 0) -> tu
     return objectives, validation
 
 
+# TODO: Implement config file passing and setting instead of all command line switches.
 @dataclass
 class FFSATConfig:
     """Configuration for FFSAT solver."""

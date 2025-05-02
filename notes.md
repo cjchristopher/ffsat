@@ -9,3 +9,10 @@ Thoughts and Notes:
 
 * Starting points:
 * * For some reason the original implementation uses normal distribution centred at 0, instead of uniform. I'm not sure if there is any benefit to this! In fact, intuition says maybe there is a draw back - we want even coverage of the space so it should be uniform!
+
+
+TODO:
+* Start from SAT assignment- progressively degrade vertices (ramsey). How does performance change (iters, speed of solution, etc.)
+* Start all negative.
+* Sampling? This problem has 66% False variables. SAT problems in general have a higher density of false. Bias starting points? Bias towards 0?
+* 
