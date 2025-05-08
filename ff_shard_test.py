@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 import sys
 
@@ -32,18 +34,24 @@ from tqdm import tqdm
 
 from boolean_whf import Objective, class_idno
 from sat_loader import Formula
-from utils import preprocess_to_matrix
+from utils import process_clauses
 
 jax.config.update("jax_compilation_cache_dir", "/tmp/jax-cache")
 jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
 jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
 # jax.config.update("jax_persistent_cache_enable_xla_caches", "all")
-#jax.config.update("jax_explain_cache_misses", True)
+
 jax.config.update("jax_enable_x64", True)
-jax.config.update("jax_enable_checks", True)
+jax.config.update("jax_default_matmul_precision", "highest")
+jax.config.update("jax_optimization_level", "O3")
+# jax.config.update("jax_no_tracing", True)
 # jax.config.update("jax_disable_jit", True)
 
-
+# DEBUGGING BLOCK
+# jax.config.update("jax_debug_nans", True)
+# jax.config.update("jax_enable_checks", True)
+# jax.config.update("jax_explain_cache_misses", True)
+# jax.config.update("jax_check_tracer_leaks", True)
 # fh = logging.FileHandler(filename="jax.log")
 # fh.setLevel(logging.DEBUG)
 # logging.basicConfig(level=logging.INFO)
@@ -114,8 +122,8 @@ def eval_verify(objs: tuple[Objective, ...], combined: bool) -> tuple[Callable, 
             prod = jnp.prod(dft + assignment[:, None, :], axis=2, where=forward_mask)
             clause_eval = jnp.sum(idft * prod, axis=1).real
             # TODO: think about this
-            cost = jnp.where(clause_eval > 0, clause_eval * weight, clause_eval)
-            # cost = weight * clause_eval
+            # cost = jnp.where(clause_eval > 0, clause_eval * weight, clause_eval)
+            cost = weight * clause_eval
             return jnp.sum(cost)
 
         def verify(x: Array) -> Array:
@@ -170,7 +178,7 @@ def eval_verify(objs: tuple[Objective, ...], combined: bool) -> tuple[Callable, 
         print(f"TRACING evaluate_all with shapes: {x.shape}, {[w.shape for w in weights]}")
         costs = [eval_fn(x, weight) for (eval_fn, weight) in zip(evaluators, weights)]
         cost = jnp.sum(jnp.array(costs))
-        #jax.debug.print("xx: {}, {}, {}, {}", x.shape, x[:3], cost, costs)
+        # jax.debug.print("xx: {}, {}, {}, {}", x.shape, x[:3], cost, costs)
         # jax.core.
         # if jax.core.cur_sublevel().name:
         #     jax.debug.print("XX LOC: {}", jax.core.cur_sublevel().name)
@@ -229,13 +237,15 @@ def run_solver(
     opt_combined: bool,
     objs: tuple[Objective, ...],
     v_start: bool = False,
+    n_devices: int = 1,
 ) -> float:
     # Create device mesh, declare JAX specs, and shard:
-    tsolver = time()
-    #print("Solver Init", file=sys.stderr)
-    devices = jax.devices("gpu")
-    gpu_batch = batch_sz * len(devices)
-    weights = [jnp.ones_like(obj.clauses.types) for obj in objs]
+    #tsolver = time()
+    # print("Solver Init", file=sys.stderr)
+    #TODO: enabled parameterisation for TPU?
+    devices = jax.devices("gpu")[:n_devices]
+    device_batch = batch_sz * len(devices)
+    weights = [jnp.ones_like(obj.clauses.types, dtype=float) for obj in objs]
     mesh = Mesh(devices, ("device",))
     shard_spec = P("device")
     restart = np.inf if not restart else restart
@@ -251,19 +261,20 @@ def run_solver(
     key = jax.random.PRNGKey(restart_ct)
     fuzz_key = jax.random.PRNGKey(restart_ct + 1)
     timeout_m, timeout_s = divmod(timeout, 60)
-    #print("Complete Init", time() - tsolver, file=sys.stderr)
+    # print("Complete Init", time() - tsolver, file=sys.stderr)
     t0 = time()
 
     with mesh:
-        #print("Before shardings", time() - tsolver, file=sys.stderr)
+        # print("Before shardings", time() - tsolver, file=sys.stderr)
         clause_sharding = NamedSharding(mesh, shard_spec)
         sharded_objs = tuple(shard_objective(obj, clause_sharding) for obj in objs)
         sharded_weight = [jax.device_put(weight, clause_sharding) for weight in weights]
-        #print("After shardings", time() - tsolver, file=sys.stderr)
+        # print("After shardings", time() - tsolver, file=sys.stderr)
 
         def process_batch(x_batch: Array, weights: list[Array]) -> tuple[Array, Array, Array, Array]:
             print(
-                f"TRACING process_batch at time {time() - t0:.2f}s with shapes: {x_batch.shape}, {[w.shape for w in weights]}"
+                f"TRACING process_batch at time {time() - t0:.2f}s with shapes: {x_batch.shape}, {[w.shape for w in weights]}",
+                f"\nAND TYPES {type(x_batch)} (x) + \n{type(weights)}/{type(weights[0])} (weights/[i])",
             )
             evaluator, verifier = eval_verify(sharded_objs, opt_combined)
             # TODO: Set solver and .run args as well somehow.
@@ -272,7 +283,7 @@ def run_solver(
             def optimize(x: Array) -> tuple[Array, Array, Array]:
                 print(f"TRACING optimize with shapes: {x.shape}")
                 # x_opt, state = solver.run(x, hyperparams_proj=(-1, 1), weights=weights) #PDG
-                #jax.debug.print(
+                # jax.debug.print(
                 #     "Combined?: {} | x_shard shape: {} | dtype: {} | min: {} | max: {} | mean: {}",
                 #     opt_combined,
                 #     x.shape,
@@ -285,7 +296,7 @@ def run_solver(
                     x, bounds=(-1 * jnp.ones_like(x), jnp.ones_like(x)), weights=weights
                 )  # L-BFGS-B
                 unsat = jnp.squeeze(verifier(x_opt))
-                #jax.debug.print(
+                # jax.debug.print(
                 #     "AO Batch scores: {} | Mean: {} | Steps: {}", state.aux, jnp.mean(state.aux), state.iter_num
                 # )
                 return x_opt, unsat, jnp.atleast_1d(state.iter_num), state.aux
@@ -302,22 +313,22 @@ def run_solver(
 
             print(f"TRACING process_batch finished {time() - t0:.2f}s")
             print(f"TRACING x_shard {x_shard.shape}")
-            #jax.debug.print("First few values of x_shard: \n{}", x_shard[:, :3])
+            # jax.debug.print("First few values of x_shard: \n{}", x_shard[:, :3])
             if not opt_combined:
                 t_res, _ = jax.vmap(evaluator, in_axes=(0, None))(x_batch, weights)
-                #jax.debug.print("Initial Evals:\n{}\n{}", jnp.mean(t_res), t_res)
+                # jax.debug.print("Initial Evals:\n{}\n{}", jnp.mean(t_res), t_res)
             else:
                 t_res, t_list = evaluator(x_batch, weights)
-                #jax.debug.print("Initial Evals:\n{}\n{}", t_res, t_list)
+                # jax.debug.print("Initial Evals:\n{}\n{}", t_res, t_list)
 
             x_opt, unsat, iters, eval_scores = optimize_batch(x_shard)
-            #jax.debug.print("{}", unsat.shape)
+            # jax.debug.print("{}", unsat.shape)
             unsat_cl_count = jnp.sum(jnp.atleast_1d(unsat), axis=0)
             return x_opt, unsat, iters, unsat_cl_count, eval_scores
 
-        #print("JIT the whole thing", time() - tsolver, file=sys.stderr)
+        # print("JIT the whole thing", time() - tsolver, file=sys.stderr)
         opt_batch = jax.jit(process_batch, in_shardings=(None, [clause_sharding] * len(weights)))
-        #print("JITTED", time() - tsolver, file=sys.stderr)
+        # print("JITTED", time() - tsolver, file=sys.stderr)
 
         batch_time = t0
         pbar = tqdm(
@@ -326,14 +337,14 @@ def run_solver(
             bar_format="{l_bar}{bar}| {elapsed}/" + str(timeout_m).zfill(2) + ":" + str(timeout_s).zfill(2),
         )
         while time() - t0 < timeout:
-            fh = logging.FileHandler(filename="jax_{}_{}.log".format(restart_ct, starts))
+            #fh = logging.FileHandler(filename="jax_{}_{}.log".format(restart_ct, starts))
             # Remove any existing handlers
             # for handler in jaxlog.handlers[:]:
             #     jaxlog.removeHandler(handler)
             # jaxlog.addHandler(fh)
 
             tloop = time()
-            #print("##### New Loop start || elapsed since call to run:", tloop - tsolver, file=sys.stderr)
+            # print("##### New Loop start || elapsed since call to run:", tloop - tsolver, file=sys.stderr)
             key, subkey = jax.random.split(key)
             fuzz_key, subfuzz_key = jax.random.split(fuzz_key)
 
@@ -343,7 +354,7 @@ def run_solver(
                 case "bias":
                     # Generate values biased towards 1 (False) while maintaining full [-1, 1] range
                     # Method 1: Using power transformation with bias_strength (original)
-                    u = jax.random.uniform(subkey, minval=0.0, maxval=1.0, shape=(gpu_batch, n_vars))
+                    u = jax.random.uniform(subkey, minval=0.0, maxval=1.0, shape=(device_batch, n_vars))
                     bias_strength = 0.5  # Lower value = stronger bias towards 1 (values 0-1)
                     x0 = 2 * u**bias_strength - 1
                 case "coin":
@@ -351,12 +362,12 @@ def run_solver(
                     # Uncomment to use this method instead
                     false_prob = 0.7  # Y% probability of generating values tending towards False
                     coin_key, subkey = jax.random.split(subkey)
-                    biased_coins = jax.random.bernoulli(coin_key, p=false_prob, shape=(gpu_batch, n_vars))
+                    biased_coins = jax.random.bernoulli(coin_key, p=false_prob, shape=(device_batch, n_vars))
                     signs = 2 * biased_coins - 1  # Convert to -1/1
-                    magnitudes = jax.random.uniform(subkey, minval=0.0, maxval=1.0, shape=(gpu_batch, n_vars))
+                    magnitudes = jax.random.uniform(subkey, minval=0.0, maxval=1.0, shape=(device_batch, n_vars))
                     x0 = signs * magnitudes
                 case "uniform" | _:
-                    x0 = jax.random.uniform(subkey, minval=-1, maxval=1, shape=(gpu_batch, n_vars))
+                    x0 = jax.random.uniform(subkey, minval=-1, maxval=1, shape=(device_batch, n_vars))
 
             fuzz = jax.random.uniform(subfuzz_key, minval=1e-10, maxval=1e-4, shape=x0.shape)
             fuzz_attempt = 0
@@ -366,21 +377,21 @@ def run_solver(
                 x0 = jnp.sign(x0)
                 x0 = x0 + -x0 * fuzz
             # x_starts = x0[:]
-            #print("Random keys regen & snap", time() - tloop, file=sys.stderr)
+            # print("Random keys regen & snap", time() - tloop, file=sys.stderr)
 
             # Do it.
-            #print("Before OPT call", time() - tloop, file=sys.stderr)
+            print("Before OPT call", time() - tloop, file=sys.stderr)
             # with jax.profiler.trace(f"/tmp/jax-trace-restart-{restart_ct}", create_perfetto_link=True):
             #     opt_x0, opt_unsat, opt_iters, opt_unsat_ct, eval_scores = opt_batch(x0, sharded_weight)
-            print(x0.shape)
+            print(type(sharded_weight), "\n", type(sharded_weight[0]), "\n", sharded_weight)
             opt_x0, opt_unsat, opt_iters, opt_unsat_ct, eval_scores = opt_batch(x0, sharded_weight)
-            #print("After OPT call", time() - tloop, file=sys.stderr)
+            print("After OPT call", time() - tloop, file=sys.stderr)
             batch_unsat_scores = jnp.sum(jnp.atleast_2d(opt_unsat), axis=1)
             print("unsat scores:", batch_unsat_scores, "\n eval scores:", eval_scores)
             batch_best = jnp.min(batch_unsat_scores)
             print("eval of best score:", batch_best, jnp.max(jnp.abs(eval_scores)))
             best_unsat = batch_best if batch_best < best_unsat else best_unsat
-            #print("After some JNP + maybe fuzz next", time() - tloop, file=sys.stderr)
+            # print("After some JNP + maybe fuzz next", time() - tloop, file=sys.stderr)
 
             found_sol = False
             if batch_best == 0:
@@ -397,20 +408,20 @@ def run_solver(
                 while fuzz_attempt < fuzz_limit:
                     fuzz_attempt += 1
                     xFC = xF[:]
-                    flip = xF + fuzz**(1/fuzz_mag)
-                    flip = (jnp.abs(flip) > 1)
-                    #fuzz = jnp.where(flip, -fuzz, fuzz)
-                    #xF = xF + -jnp.sign(xF) * fuzz**fuzz_mag
-                    fuzz = (jnp.sign(fuzz)*jnp.abs(fuzz)**(1/fuzz_mag))
+                    flip = xF + fuzz ** (1 / fuzz_mag)
+                    flip = jnp.abs(flip) > 1
+                    # fuzz = jnp.where(flip, -fuzz, fuzz)
+                    # xF = xF + -jnp.sign(xF) * fuzz**fuzz_mag
+                    fuzz = jnp.sign(fuzz) * jnp.abs(fuzz) ** (1 / fuzz_mag)
                     print(fuzz[0][0:5])
                     xF = jnp.clip(xF + fuzz, -1, 1)
                     print(f"FUZZ {fuzz_mag}:", xF[0][:5])
-                    #print("Before OPT+FUZZ call", time() - tloop, file=sys.stderr)
+                    # print("Before OPT+FUZZ call", time() - tloop, file=sys.stderr)
                     opt_xF, opt_unsatF, opt_itersF, opt_unsat_ctF, eval_scoresF = opt_batch(xF, sharded_weight)
-                    #print("After OPT+FUZZ call", time() - tloop, file=sys.stderr)
+                    # print("After OPT+FUZZ call", time() - tloop, file=sys.stderr)
                     batch_unsatF_scores = jnp.sum(jnp.atleast_2d(opt_unsatF), axis=1)
                     batch_bestF = jnp.min(batch_unsatF_scores)
-                    #print("JNP stuff on FUZZ results", time() - tloop, file=sys.stderr)
+                    # print("JNP stuff on FUZZ results", time() - tloop, file=sys.stderr)
                     if batch_bestF < best_unsat:
                         best_unsat = batch_bestF
                         opt_x0, opt_unsat, opt_iters, opt_unsat_ct = xF, opt_unsatF, opt_itersF, opt_unsat_ctF
@@ -423,17 +434,19 @@ def run_solver(
                         fuzz_mag += 1
                     else:
                         mymask = jnp.nonzero(jnp.sign(xFC) != jnp.sign(opt_xF))
-                        fnz = (mymask[0][0],mymask[1][0])
-                        print(f"diff at pos {fnz}, start {xFC[fnz]} + fuzz {fuzz[fnz]} = {xF[fnz]}. Descended to {opt_xF[fnz]}")
+                        fnz = (mymask[0][0], mymask[1][0])
+                        print(
+                            f"diff at pos {fnz}, start {xFC[fnz]} + fuzz {fuzz[fnz]} = {xF[fnz]}. Descended to {opt_xF[fnz]}"
+                        )
                         fuzz_mag = 1
                     xF = opt_xF
-                    #print(f"Optim Iters: min: {jnp.min(opt_itersF)}, max: {jnp.max(opt_itersF)}, mean: {jnp.mean(opt_itersF)}")
-            #print(fuzz_limit, "Fuzz complete", time() - tloop, file=sys.stderr)
+                    # print(f"Optim Iters: min: {jnp.min(opt_itersF)}, max: {jnp.max(opt_itersF)}, mean: {jnp.mean(opt_itersF)}")
+            # print(fuzz_limit, "Fuzz complete", time() - tloop, file=sys.stderr)
 
             loc = jnp.argmin(batch_unsat_scores)
             best_x = opt_x0[loc]
             best_unsat_clause_idx = jnp.nonzero(jnp.atleast_2d(opt_unsat)[loc])
-            #print("Stats gather", time() - tloop, file=sys.stderr)
+            # print("Stats gather", time() - tloop, file=sys.stderr)
             # clauses = {}
             # for
             # best_start = x_starts[loc]
@@ -461,11 +474,11 @@ def run_solver(
 
             all_iters.append(opt_iters)
             all_unsat_cts.append(opt_unsat_ct)
-            starts += gpu_batch
+            starts += 1
             if starts >= restart:
-                #break
-                #print("Performing restart", time() - tloop, file=sys.stderr)
-                #print("Memory before restart:", jax.devices()[0].memory_stats(), file=sys.stderr)
+                # break
+                # print("Performing restart", time() - tloop, file=sys.stderr)
+                # print("Memory before restart:", jax.devices()[0].memory_stats(), file=sys.stderr)
                 # Statistics for this restart
                 iters = jnp.concat(all_iters)
                 unsat_ct = jnp.array(all_unsat_cts)
@@ -485,7 +498,7 @@ def run_solver(
                 worst = penalty.max()
 
                 print(
-                    f"Unsat counts: {penalty}, Objs: {[obj.clauses.lits.shape for obj in objs]}, Best: {best_unsat_clause_idx}"
+                    f"Unsat counts: {penalty}, \nObjs: {[obj.clauses.lits.shape for obj in objs]}, \nBest: {best_unsat_clause_idx}"
                 )
                 pen_start = 0
                 # adjust to always target -k?
@@ -496,38 +509,38 @@ def run_solver(
                     adj_weight = jnp.where(w_pens > 0, weight + 0.1 * w_pens / worst, 1)
                     sharded_weight[idx] = jax.device_put(adj_weight, clause_sharding)
                     pen_start += n_clause
-                tx = time()
-                #print(time() - tx, "SEP time to reload weights", file=sys.stderr)
+                # tx = time()
+                # print(time() - tx, "SEP time to reload weights", file=sys.stderr)
 
                 stamp = time()
                 print("Restart time: {:.2f}/{}".format(stamp - t0, timeout))
-                #print("Memory after restart:", jax.devices()[0].memory_stats(), file=sys.stderr)
-                #print("Restart complete", time() - tloop, file=sys.stderr)
+                # print("Memory after restart:", jax.devices()[0].memory_stats(), file=sys.stderr)
+                # print("Restart complete", time() - tloop, file=sys.stderr)
 
             pbar.set_description(f"restart {restart_ct} ({starts}/{restart} -- best={best_unsat})")
             pbar.update(time() - batch_time)
             batch_time = time()
-            #print("end loop", time() - tloop, file=sys.stderr)
+            # print("end loop", time() - tloop, file=sys.stderr)
         pbar.close()
     return time() - t0
 
 
 def main(
-    dimacs: str, mode: Opt[int], timeout: int, batch: int, restart: int, fuzz: int, combine: bool, vertex: bool
+    file: str, mode: int, timeout: int, batch: int, restart: int, fuzz: int, combine: bool, vertex: bool, n_devices: int
 ) -> None:
-    if dimacs is None:
+    if file is None:
         print("Error: Please provide a (hybrid) dimacs CNF file")
         return 1
 
     sat = Formula()
     stamp1 = time()
-    sat.read_DIMACS(dimacs)
+    sat.read_DIMACS(file)
     stamp2 = time()
     read_time = stamp2 - stamp1
 
     n_vars = sat.n_var
     # n_clause = sat.n_clause
-    objectives, _ = preprocess_to_matrix(sat, mode)
+    objectives, _ = process_clauses(sat, mode, n_devices=n_devices)
     stamp1 = time()
     process_time = stamp1 - stamp2
 
@@ -544,31 +557,18 @@ if __name__ == "__main__":
     ap = ArgParse(description="Process a file with optional parameters")
     ap.add_argument("file", help="The file to process")
     ap.add_argument("-p", "--profile", action="store_true", help="Enable profiling")
-    ap.add_argument("-t", "--timeout", type=int, default=300, help="Maximum time to run (timeout seconds)")
-    ap.add_argument("-b", "--batch", type=int, default=16, help="Batch size per GPU")
+    ap.add_argument("-t", "--timeout", type=int, default=300, help="Maximum runtime (timeout seconds)")
+    ap.add_argument("-b", "--batch", type=int, default=16, help="Batch size")
     ap.add_argument("-f", "--fuzz", type=int, default=0, help="Number of times to attempt fuzzing per batch")
-    ap.add_argument("-v", "--vertex", action="store_true", help="Start near a vertices")
-    ap.add_argument(
-        "-c", "--combine", action="store_true", help="Optimise a batch of points with one call to the optimiser"
-    )
-    ap.add_argument(
-        "-r",
-        "--restart",
-        type=int,
-        default=0,
-        help="Points to test before adjusting weight and restarting (no weight/restart if 0)",
-    )
-    ap.add_argument(
-        "-m",
-        "--mode",
-        type=int,
-        default=0,
-        help="Which clause partitioning mode to use. Mode 0 to be prompted after reading input",
-    )
+    ap.add_argument("-v", "--vertex", action="store_true", help="Start near vertices")
+    ap.add_argument("-c", "--combine", action="store_true", help="Jointly optimise entire batches")
+    ap.add_argument("-r", "--restart", type=int, default=0, help="Batches before reweight and restart (never if 0)")
+    ap.add_argument("-m", "--mode", type=int, default=0, help="Clause partitioning mode. Provide 0 to be asked")
+    ap.add_argument("-n", "--n_devices", type=int, default=0, help="Devices (eg. GPUs) to use. 0 uses all")
 
-    args = ap.parse_args()
+    arg = ap.parse_args()
 
     # Run with or without profiler based on the flag
-    profiler = jax.profiler.trace("/tmp/jax-trace", create_perfetto_link=True) if args.profile else nullcontext()
+    profiler = jax.profiler.trace("/tmp/jax-trace", create_perfetto_link=True) if arg.profile else nullcontext()
     with profiler:
-        main(args.file, args.mode, args.timeout, args.batch, args.restart, args.fuzz, args.combine, args.vertex)
+        main(arg.file, arg.mode, arg.timeout, arg.batch, arg.restart, arg.fuzz, arg.combine, arg.vertex, arg.n_devices)

@@ -27,9 +27,9 @@ def valid_choice(value: str) -> int:
     return choice_map[value]
 
 
-def preprocess_to_matrix(sat: Formula, mode: Opt[int], threshold: int = 0) -> tuple[tuple[Objective, ...], Validators]:
+def process_clauses(sat: Formula, mode: int, threshold: int = 0, n_devices: int = 1) -> tuple[tuple[Objective, ...], Validators]:
     clause_grps: dict[str, ClauseGroup] = {}
-    if mode is not None and mode > 0:
+    if mode > 0:
         choice = valid_choice(str(mode))
     else:
         print("Please see the following clause type and clause length breakdowns and select an option:")
@@ -46,31 +46,29 @@ def preprocess_to_matrix(sat: Formula, mode: Opt[int], threshold: int = 0) -> tu
         )
         choice = typer.prompt("Options", type=valid_choice, default="3")
 
-    n_var = sat.n_var
-    # We need the breakdown by clause type anyway for quick validation.
     # TODO: No longer required - left for backwards compatibility with the unsharded code.
     # Once unsharded is factored, this first loop should become the last block in the match/case below.
+    # We need the breakdown by clause type anyway for quick validation.
     for c_type, c_list in sat.clauses_type.items():
         if c_list:
             # Clauses present, do FFTs if user partition choice was by type.
-            clause_grps[c_type] = ClauseGroup(c_list, n_var, do_fft=(choice == "types"), clause_type=c_type)
+            clause_grps[c_type] = ClauseGroup(c_list, sat.n_var, choice == "types", c_type, n_devices)
         else:
             clause_grps[c_type] = None
 
     match choice:
         case "full":
-            clause_grps["full"] = ClauseGroup(sat.clauses_all, n_var, do_fft=True, clause_type="all")
+            clause_grps["full"] = ClauseGroup(sat.clauses_all, sat.n_var, True, "all", n_devices)
         case "lens":
             # thresh = 0
             # TODO: Implement clustering with some threshold?
             for c_len, c_list in sat.clauses_len.items():
-                clause_grps[c_len] = ClauseGroup(c_list, n_var, do_fft=True, clause_type="mixed")
-        case _:
+                clause_grps[c_len] = ClauseGroup(c_list, sat.n_var, True, "mixed", n_devices)
+        case "types" | _:
             # type already proesssed above.
             pass
 
-    # Process groups (in parallel).
-    def process_groups(clause_grps: dict[str, ClauseGroup], max_workers: Opt[int] = None):
+    def parallel_clause_process(clause_grps: dict[str, ClauseGroup], max_workers: Opt[int] = None):
         def process(grp: ClauseGroup):
             aux_grp = grp.process()
             return aux_grp
@@ -81,20 +79,21 @@ def preprocess_to_matrix(sat: Formula, mode: Opt[int], threshold: int = 0) -> tu
             for task in tasks:
                 res.append(task.result())
 
-        # Collect detected unit literals
+        # Deal with any detected unit literals
         lits = set()
         for r in res:
             if r is not None:
                 lits.update(r)
         if lits:
             unit_lits = [Clause("cnf", [lit], 0) for lit in lits]
-            unit_lits = ClauseGroup(unit_lits, len(unit_lits), do_fft=True, clause_type="cnf")
+            unit_lits = ClauseGroup(unit_lits, len(unit_lits), True, "cnf", n_devices)
             unit_lits.process()
             return [unit_lits]
+
         return []
 
-    objectives = process_groups(clause_grps, max_workers=min(len(clause_grps), 8))
-    empty_Validation = empty_validator(n_var)
+    objectives = parallel_clause_process(clause_grps, max_workers=min(len(clause_grps), 8))
+    empty_Validation = empty_validator(sat.n_var)
     validation = {}
 
     # TODO: As above, separate validation no longer required, but left for compat with unsharded.

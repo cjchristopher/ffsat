@@ -62,6 +62,8 @@ def convert_file(input_file, output_file):
         pbo_cons = []
         for line in infile:
             words = line.split(" ")
+            if words[0] == "c":
+                continue
             if not var_cnt:
                 if words[0] == "p" and words[1] in ("hybrid", "pbo"):
                     var_cnt = int(words[2])
@@ -89,7 +91,7 @@ def convert_file(input_file, output_file):
             pbo_cons.append(pbo_constraint)
 
         # Write file.
-        outfile.write(f"* #variable= {var_cnt} #constraint= {cls_cnt}\n*")
+        outfile.write(f"* #variable= {var_cnt} #constraint= {cls_cnt}*\n")
         for con in pbo_cons:
             outfile.write(con + "\n")
 
