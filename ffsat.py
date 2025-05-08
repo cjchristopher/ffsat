@@ -1,4 +1,5 @@
 # Uncomment if you need to inspect precise memory allocation/movements
+from __future__ import annotations
 import os
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"  # Disable pre-allocation
 #os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"  # Use platform-specific allocator
@@ -19,7 +20,7 @@ from tqdm import tqdm
 
 from boolean_whf import Objective
 from sat_loader import Formula
-from utils import Validators, preprocess_to_matrix
+from utils import Validators, process_clauses
 
 jax.config.update("jax_enable_x64", True)
 jax.config.update('jax_enable_checks', True)
@@ -385,7 +386,7 @@ def main(dimacs: str = None, tasks: int = 32, batch: int = 16, mode: Opt[int] = 
 
     n_vars = sat.n_var
     n_clause = sat.n_clause
-    objectives, validation = preprocess_to_matrix(sat, mode)
+    objectives, validation = process_clauses(sat, mode)
     stamp1 = time()
     process_time = stamp1 - stamp2
 

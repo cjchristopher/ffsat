@@ -1,3 +1,4 @@
+from __future__ import annotations
 import sys
 from boolean_whf import Clause, class_idno
 
@@ -63,16 +64,17 @@ class Formula(object):
                 for line in f:
                     split = line.split()
                     if len(line) == 0 or split[0] == "c" or split[0] == "*":
-                        # Comments
+                        # Skip comments
                         pass
                     elif split[0] == "p":
-                        # Read p line (problem metadata)
+                        # Problem metadata
                         self.n_var = int(split[-2])
                         self.n_clause = int(split[-1])
                     else:
                         # Process constraint
                         # TODO: Fix format detection (dimacs vs pbo vs ???)
-                        if h_tag == -1:  # only true once. Will cause files with inconsistent formatting to break
+                        if h_tag == -1:
+                            # only true once. Will cause files with inconsistent formatting to break
                             if split[0] == "h" or (split[0] == "1" and split[1] == "x"):
                                 h_tag = 1
                             else:
