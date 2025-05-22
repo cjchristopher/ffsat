@@ -92,6 +92,9 @@ def process_clauses(sat: Formula, mode: int, threshold: int = 0, n_devices: int 
 
         return []
 
+    # N.B. Using multiple works can cause XLA cache conflicts if using "all" persistent caches.
+    # All is broken for some jaxopt optimizers however, so we don't use it. If we do, max_workers should be 1 to avoid
+    # race conditions deep in XLA (see jax.config.update("jax_persistent_cache_enable_xla_caches", "all"))
     objectives = parallel_clause_process(clause_grps, max_workers=min(len(clause_grps), 8))
     empty_Validation = empty_validator(sat.n_var)
     validation = {}
