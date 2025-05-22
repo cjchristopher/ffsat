@@ -6,7 +6,7 @@ from typing import Optional as Opt
 
 import jax.numpy as jnp
 
-# from jax.experimental.sparse import BCOO
+#from jax.experimental.sparse import BCOO
 import numpy as np
 from jax.typing import ArrayLike as Array
 from scipy.linalg import dft as dft_table
@@ -33,7 +33,7 @@ class ClauseArrays(NamedTuple):
     mask: Array = jnp.empty((0, 0), dtype=bool)
     types: Array = jnp.empty((0, 0), dtype=int)
     cards: Array = jnp.empty((0, 0), dtype=int)
-    sparse: Array = jnp.empty((0, 0, 0), dtype=int)
+    #sparse: Array = jnp.empty((0, 0, 0), dtype=int)
 
 
 class Objective(NamedTuple):
@@ -46,7 +46,8 @@ class_idno: dict[str, int] = {"xor": 1, "eo": 2, "nae": 3, "cnf": 4, "amo": 5, "
 
 
 def empty_validator(n_var: int) -> ClauseArrays:
-    return Objective(clauses=ClauseArrays(sparse=jnp.zeros((0, 0, n_var), dtype=int)))
+    return Objective(clauses=ClauseArrays())
+    #return Objective(clauses=ClauseArrays(sparse=jnp.zeros((0, 0, n_var), dtype=int)))
 
 
 class ClauseGroup:
@@ -70,28 +71,30 @@ class ClauseGroup:
                 self.disk_cache: dict = do_fft
             self.live_cache: dict = {}
 
-    def _to_array(self, clauses: list[Clause], sparse_addr: bool = False, n_devices: int = 1) -> ClauseArrays:
+    def _to_array(self, clauses: list[Clause], n_devices: int = 1) -> ClauseArrays: #sparse_addr: bool = True, 
         # Convert clauses to lists
         lits, cards, types = zip(*[(clause.lits, [clause.card], class_idno[clause.type]) for clause in clauses])
-        lits, mask = self._pad(lits, n_devices = n_devices)
-        types, _ = self._pad([[t] for t in types], n_devices = n_devices)
-        cards, _ = self._pad(cards, n_devices = n_devices)
+        lits, mask = self._pad(lits, n_devices=n_devices)
+        types, _ = self._pad([[t] for t in types], n_devices=n_devices)
+        cards, _ = self._pad(cards, n_devices=n_devices)
 
         # Convert to jax
-        sign = jnp.where(mask, jnp.sign(lits), 0)
-        lits = jnp.where(mask, jnp.abs(lits) - 1, lits)
+        # temp = jnp.sign(lits)
+        sign = jnp.where(mask, np.sign(lits), 0)
+        # temp = jnp.abs(lits)
+        lits = jnp.where(mask, np.abs(lits) - 1, lits)
         mask = jnp.array(mask)
         types = jnp.array(types).squeeze()
         cards = jnp.array(cards).squeeze()
 
-        sparse = None
-        if sparse_addr:
-            # Use matrix multiplication instead of indexing
-            sparse = jnp.zeros((lits.shape[0], lits.shape[1], self.n_var))
-            sparse = sparse.at[jnp.arange(lits.shape[0])[:, None], jnp.arange(lits.shape[1]), lits].set(1)
-            # sparse = sparse.BCOO.fromdense(sparse)
+        # sparse = None
+        # if sparse_addr:
+        #     # Use matrix multiplication instead of indexing
+        #     sparse = jnp.zeros((lits.shape[0], lits.shape[1], self.n_var))
+        #     sparse = sparse.at[jnp.arange(lits.shape[0])[:, None], jnp.arange(lits.shape[1]), lits].set(1)
+        #     sparse = BCOO.fromdense(sparse)
 
-        return ClauseArrays(lits=lits, sign=sign, mask=mask, types=types, cards=cards, sparse=sparse)
+        return ClauseArrays(lits=lits, sign=sign, mask=mask, types=types, cards=cards)#, sparse=sparse)
 
     @classmethod
     def _wf_coeff_cnf(cls, n: int) -> Array:
@@ -272,7 +275,7 @@ class ClauseGroup:
 
                 if k == 1:  # implicitly $$n>1$$ at this stage.
                     # Change clause type if we aren't in a "CARD" specific clause group, very minor impact.
-                    print("WARNING: Detected CNF encoded as cardinality-1 clause", file=sys.stderr)
+                    #print("WARNING: Detected CNF encoded as cardinality-1 clause", file=sys.stderr)
                     if self.clause_type != "card":
                         t = "cnf"
                         k = 0
@@ -287,53 +290,53 @@ class ClauseGroup:
 
             if (t, n, k) in self.live_cache:
                 # fastest
-                fft = self.live_cache[(t, n, k)]
+                clause_fft = self.live_cache[(t, n, k)]
             elif (t, n, k) in self.disk_cache:
                 # check if computed in disk cache
-                fft = self.disk_cache[(t, n, k)]
-                self.live_cache[(t, n, k)] = fft
+                clause_fft = self.disk_cache[(t, n, k)]
+                self.live_cache[(t, n, k)] = clause_fft
             else:
                 # manual compute using closed form FWH Coefficients. 1/n applied to idft.
                 coeff = self._wf_coeff(t, n, k)
                 dft: Array = dft_table(n + 1)
                 idft = coeff[::-1] @ np.conjugate(dft) / (n + 1)
                 dft = dft[1].reshape(n + 1, 1)
-                fft = FFT(dft, idft)
+                clause_fft = FFT(dft, idft)
                 # update cachecs
-                self.live_cache[(t, n, k)] = fft
+                self.live_cache[(t, n, k)] = clause_fft
                 if isinstance(self.do_fft, FFSATCache):
-                    self.do_fft.put((t, n, k), fft)
+                    self.do_fft.put((t, n, k), clause_fft)
 
-            dfts.append(fft.dft)
-            idfts.append(fft.idft)
+            dfts.append(clause_fft.dft)
+            idfts.append(clause_fft.idft)
 
         for clause_idx in sorted(del_list, reverse=True):
             clauses.pop(clause_idx)
 
-        dfts, dfts_mask = [jnp.array(arr) for arr in self._pad(dfts, n_devices = n_devices)]
-        idfts = jnp.array(self._pad(idfts, n_devices = n_devices)[0])
-        return fft, dfts_mask, unit_lits
+        dfts, dfts_mask = self._pad(dfts, n_devices=n_devices)
+        idfts, _ = self._pad(idfts, n_devices=n_devices)
+        return FFT(dft=jnp.array(dfts), idft=jnp.array(idfts)), jnp.array(dfts_mask), unit_lits
 
     def _pad(self, arrays: list[Array | list[int]], pad_val: Opt[int] = 0, n_devices: int = 1) -> tuple[Array, Array]:
         arrays = [np.array(arr) if isinstance(arr, (list, int)) else arr for arr in arrays]
-        extra_rows = n_devices - (len(arrays) % n_devices)
+        rows = len(arrays)
+        extra_rows = n_devices - (rows % n_devices)
         dtype = np.result_type(*arrays, pad_val)
 
         if arrays[0].ndim <= 1:
             max_length = max(len(arr) for arr in arrays)
-            padded_shape = (len(arrays)+extra_rows, max_length)
+            padded_shape = (rows + extra_rows, max_length)
             padded = np.full(padded_shape, pad_val, dtype=dtype)
-
-            for i, arr in enumerate(arrays):
-                padded[i, : len(arr)] = arr
-
             mask = np.zeros_like(padded, dtype=bool)
+
             for i, arr in enumerate(arrays):
-                mask[i, : len(arr)] = True
+                row_len = len(arr)
+                padded[i, :row_len] = arr.ravel()
+                mask[i, :row_len] = True
 
         else:
             max_dims = np.max([arr.shape for arr in arrays], axis=0)
-            padded_shape = (len(arrays)+extra_rows, *max_dims)
+            padded_shape = (rows + extra_rows, *max_dims)
             padded = np.full(padded_shape, pad_val, dtype=dtype)
             mask = np.zeros(padded_shape, dtype=bool)
 
@@ -355,6 +358,7 @@ class ClauseGroup:
             # TODO:
             # if self.update_diskcache:
             #     self._update_diskcache()
+            print(self.clause_array.lits.shape, self.ffts.dft.shape, self.ffts.idft.shape, self.ffts.dft[0], self.ffts.idft[0])
         return unit_lits
 
     def get(self) -> Objective:

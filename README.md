@@ -10,13 +10,15 @@ This solver transforms traditional discrete SAT problems into continuous optimiz
 
 ### Prerequisites
 
-- Python >=3.10+
+- Python >=3.10+ (TBD: Backward compatability to 3.8)
 - For JAX acceleration with NVIDIA:
   - CUDA >=12.1
   - CUDNN >=9.1, <10.0
   - NCCL >=2.18
   - NVIDIA Driver >=525.60.13
 - See [JAX Installation](https://docs.jax.dev/en/latest/installation.html#installation) for more details, or CPU/TPU requirements (untested).
+
+Optionally, see https://github.com/NVIDIA/JAX-Toolbox for Docker images that may work.
 
 ### Setup
 
