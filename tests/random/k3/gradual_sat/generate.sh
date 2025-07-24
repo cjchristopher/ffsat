@@ -24,5 +24,3 @@ for f in `ls ../sat/*.cnf`; do
         fi
     done
 done
-
-			    

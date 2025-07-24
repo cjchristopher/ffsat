@@ -30,3 +30,5 @@ Weight performance loss:
 
 *** TODO:
 * Collect self similar clauses for DFT matrix reduction.
+* Two sat separate pass? eval all -> eval 2 sat -> verify 2 sat -> verify all only for SAT 2sat fragments?
+* GPU G-sat implementation.
