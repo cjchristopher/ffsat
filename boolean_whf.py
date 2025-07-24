@@ -1,24 +1,27 @@
 from __future__ import annotations
 
-import sys
+import operator as ops
+from fractions import Fraction
+from itertools import accumulate
+from math import comb
 from typing import NamedTuple
 from typing import Optional as Opt
 
 import jax.numpy as jnp
-
-#from jax.experimental.sparse import BCOO
 import numpy as np
-from jax.typing import ArrayLike as Array
-from scipy.linalg import dft as dft_table
-from scipy.special import comb
+from numpy.typing import NDArray
+from jax import Array
 from scipy.stats import binom
 
 from diskcache import FFSATCache
 
+type Clause = list[int]
+type Clauses = list[Clause]
 
-class Clause(NamedTuple):
+
+class ClauseSignature(NamedTuple):
     type: str
-    lits: list[int]
+    len: int
     card: int
 
 
@@ -28,299 +31,233 @@ class FFT(NamedTuple):
 
 
 class ClauseArrays(NamedTuple):
-    lits: Array = jnp.empty((0, 0), dtype=int)
-    sign: Array = jnp.empty((0, 0), dtype=int)
-    mask: Array = jnp.empty((0, 0), dtype=bool)
-    types: Array = jnp.empty((0, 0), dtype=int)
-    cards: Array = jnp.empty((0, 0), dtype=int)
-    #sparse: Array = jnp.empty((0, 0, 0), dtype=int)
+    lits: Array  # = jnp.empty((0, 0), dtype=int)
+    sign: Array  # = jnp.empty((0, 0), dtype=int)
+    mask: Array  # = jnp.empty((0, 0), dtype=bool)
+    types: Array  # = jnp.empty((0, 0), dtype=int)
+    cards: Array  # = jnp.empty((0, 0), dtype=int)
 
 
 class Objective(NamedTuple):
-    clauses: ClauseArrays = ClauseArrays()
-    ffts: Opt[FFT] = None
-    forward_mask: Opt[Array] = None
+    clauses: ClauseArrays
+    ffts: FFT
+    forward_mask: Array
 
 
-class_idno: dict[str, int] = {"xor": 1, "eo": 2, "nae": 3, "cnf": 4, "amo": 5, "card": 0}
+clause_type_ids: dict[str, int] = {"xor": 1, "eo": 2, "nae": 3, "cnf": 4, "amo": 5, "card": 0}
 
 
-def empty_validator(n_var: int) -> ClauseArrays:
-    return Objective(clauses=ClauseArrays())
-    #return Objective(clauses=ClauseArrays(sparse=jnp.zeros((0, 0, n_var), dtype=int)))
+# class ClauseGroup:
+class ClauseProcessor:
+    def __init__(self, n_devices: int = 1, disk_cache: FFSATCache = None) -> None:
+        self.n_devices: int = n_devices
+        self.live_cache: dict = {}
+        self.disk_cache: FFSATCache | None = None
 
+        if disk_cache and isinstance(disk_cache, FFSATCache):
+            self.disk_cache: dict = disk_cache
 
-class ClauseGroup:
-    def __init__(
-        self,
-        clauses: list[Clause],
-        n_var: int,
-        do_fft: bool | FFSATCache = True,
-        clause_type: Opt[str] = None,
-        n_devices: int = 1,
-    ):
-        self.clauses = clauses
-        self.n_var = n_var
-        self.do_fft = do_fft
-        self.clause_type = clause_type  # Store clause type for diagnostics
-        self.n_devices = n_devices
-
-        if do_fft:
-            self.disk_cache: dict = {}
-            if isinstance(do_fft, FFSATCache):
-                self.disk_cache: dict = do_fft
-            self.live_cache: dict = {}
-
-    def _to_array(self, clauses: list[Clause], n_devices: int = 1) -> ClauseArrays: #sparse_addr: bool = True, 
-        # Convert clauses to lists
-        lits, cards, types = zip(*[(clause.lits, [clause.card], class_idno[clause.type]) for clause in clauses])
-        lits, mask = self._pad(lits, n_devices=n_devices)
-        types, _ = self._pad([[t] for t in types], n_devices=n_devices)
-        cards, _ = self._pad(cards, n_devices=n_devices)
-
-        # Convert to jax
-        # temp = jnp.sign(lits)
-        sign = jnp.where(mask, np.sign(lits), 0)
-        # temp = jnp.abs(lits)
-        lits = jnp.where(mask, np.abs(lits) - 1, lits)
-        mask = jnp.array(mask)
-        types = jnp.array(types).squeeze()
-        cards = jnp.array(cards).squeeze()
-
-        # sparse = None
-        # if sparse_addr:
-        #     # Use matrix multiplication instead of indexing
-        #     sparse = jnp.zeros((lits.shape[0], lits.shape[1], self.n_var))
-        #     sparse = sparse.at[jnp.arange(lits.shape[0])[:, None], jnp.arange(lits.shape[1]), lits].set(1)
-        #     sparse = BCOO.fromdense(sparse)
-
-        return ClauseArrays(lits=lits, sign=sign, mask=mask, types=types, cards=cards)#, sparse=sparse)
-
-    @classmethod
-    def _wf_coeff_cnf(cls, n: int) -> Array:
-        """Walsh-Fourier coefficients for CNF clauses."""
-        d = [1 / (2 ** (n - 1))] * (n + 1)
-        d[0] = d[0] - 1
-        return d
-
-    @classmethod
-    def _wf_coeff_eo(cls, n: int) -> Array:
-        r"""Walsh-Fourier coefficients for exactly-one (EO) clauses.
-        $$
-        \widehat{\texttt{EO}}(S) = \left\lbrace
-        \begin{aligned}
-            &1-\frac{n}{2^{n-1}} & \abs{S} = 0 \\
-            &\frac{2\abs{S}-n}{2^{n-1}} & \abs{S} \neq 0
-        \end{aligned}\right.
-        $$"""
-        d = np.arange(-n, n + 1, 2) / (2 ** (n - 1))  # EO(S) = (2|S|-n)/2^(n-1)
-        d[0] = 1 - n / (2 ** (n - 1))
-        return d
-
-    @classmethod
-    def _wf_coeff_nae(cls, n: int) -> Array:
-        r"""Walsh-Fourier coefficients for not-all-equal (NAE) clauses.
-        For all even $$|S|$$, the coefficient at that size is $$(1/2)^{n-2}$$ due to cancellation of all even terms in $$g(\rho)$$,
-        and value $${n-1\choose |S|-1}$$ at all odd terms. This cancels the denominator in the general equation,
-        leaving a factor of 2. This happens to essentially align with the $$|S|=0$$ case, but subtract 1. Hence:
-        """
-        d = np.zeros(n + 1)
-        d[::2] = 1 / (2 ** (n - 2))
-        d[0] -= 1
-        return d
-
-    @classmethod
-    def _wf_coeff_xor(cls, n: int) -> Array:
-        """Walsh-Fourier coefficients for XOR clauses.
-        All zero expect for the full product of all literals (The nth ESP in n variables).
-        """
-        d = np.zeros(n + 1)
-        d[-1] = 1
-        return d
-
-    @classmethod
-    def _wf_coeff_amo(cls, n: int) -> Array:
-        r"""Walsh-Fourier coefficients for at-most-one (AMO) clauses.
-        $$
-        \widehat{\texttt{AMO}}(S) = \left\lbrace
-        \begin{aligned}
-            &1-\frac{n-1}{2^{n-1}} & \abs{S} = 0 \\
-            &\frac{2\abs{S}-n-1}{2^{n-1}} & \abs{S} \neq 0
-        \end{aligned}\right.
-        $$
+    def _wf_coeffs(self, sig: ClauseSignature) -> Array:
+        """Calculate Walsh-Fourier coefficients for a given clause type.
+        Returns the c_len+1 coefficients as per:
+        [Constant, Degree 1 ESP, Degree 2 ESP, ..., Degree C_LEN ESP]
         """
 
-        d = np.arange(-n - 1, n, 2) / (2 ** (n - 1))
-        d[0] = 1 - (n + 1) / (2 ** (n - 1))
-        return d
+        def __int_noisepoly_numerators(n: int, k: int, neg_k: int) -> list[int]:
+            """Numpy's poly.poly.polyfromroots uses convolutions and changes to float to account for polynomial
+            construction from generic roots. For even moderate n (e.g. 120), this causes numerical errors.
+            Here our polynomial is monic, and only has roots in {-1, 1}, and so we can use the binomial theorem
+            and symmetry explotiation to be faster, and more accurate.
 
-    @classmethod
-    def _wf_coeff_card(cls, n: int, k: Opt[int] = None) -> Array:
-        r"""Walsh-Fourier coefficients for cardinality clauses.
-        This does not simplify to a clean closed form, so we require some manual computation.
-        The dominating step is polyfromroots, at $$O(n\cdot log^{2}(n))$$ for a clause of $$n$$ variables.
-        $$
-        \widehat{{\texttt{CARD}_{\geq k}}}(S) = \left\lbrace
-        \begin{aligned}
-            &1-\frac{\sum_{i=k}^{n}{n\choose i}}{2^{n-1}} & \abs{S} = 0 \\
-            &\frac{{n-1 \choose k-1}\left(g_{\texttt{CARD}}(\rho)\right)_{[p^{|S|-1}]}}{{n-1\choose |S|-1}2^{n-1}} & \abs{S} \neq 0
-        \end{aligned}\right.
-        $$
-        and $$ g_{\texttt{CARD}}(\rho) = (1+\rho)^{n-k}(1-\rho)^{k-1} $$
-        """
-        negate = -1 if k < 0 else 1
-        k = abs(k)
-        d = np.zeros(n + 1)
+            Compute the coefficients of a polynomial roots -1 ($$ n-k $$ mutiplicity) and 1 ($$ k-1 $$ multiplicity).
+            Factor in the $$(-1)^{k-1}$$ and the combinatoric constant multiplier to get the final numerators.
+            """
+            if k < 1 or k > n:
+                raise ValueError("k must satisfy 1 ≤ k ≤ n")
 
-        r"""For $$n=k$$, e.g. clause $$c = \texttt{CARD}^{\geq n}(x_1, x_2,\ldots, x_n)$$ is just $$c = x_1 \land x_2 \land \ldots \land x_n$$.
-        Then $$g_{\texttt{CARD}} = (1-\rho)^{n-1}$$. The coefficients are just the  $$(n-1)$$th row of Pascal's triangle, 
-        with every second term negated, or... $$(-1)^{|S|-1}{n-1 \choose |S|-1}$$, cancelling out.
-        This means we get a simplified form:
-        $$
-        \widehat{{\texttt{CARD}_{\geq k}}}(S) = \left\lbrace
-        \begin{aligned}
-            &1-\frac{1}{2^{n-1}} & \abs{S} = 0 \\
-            &\frac{(-1)^{|S|-1}}{2^{n-1}} & \abs{S} \neq 0
-        \end{aligned}\right.
-        $$
-        Having said this... there is merit to force reincoding this as n separate unit literals.
-        Notably those individual terms will be trivially minimisable. This form is distinctly not.
-        """
-        if n == k:
-            d = np.ones(n + 1) / (2 ** (n - 1))
-            d[::2] *= -1
-            d[0] += 1
+            coeffs = [0] * n
+            for i in range((n - k) + 1):
+                for j in range((k - 1) + 1):
+                    power = i + j
+                    if power > (n - 1) // 2:
+                        break
+                    coeff = comb((n - k), i) * comb((k - 1), j)
+                    if (k - 1 - j) % 2 == 1:
+                        coeff = -coeff
+                    coeffs[power] += coeff
+            sign = (-1) ** (k - 1)
+
+            for i in range((n - 1) // 2 + 1):
+                mirror_idx = (n - 1) - i
+                if mirror_idx != i:
+                    coeffs[mirror_idx] = sign * coeffs[i]
+
+            negate = neg_k * ((-1) ** ((k - 1) % 2))
+            const = comb(n - 1, k - 1)
+            coeffs = [const * (negate * coeff) for coeff in coeffs]
+            assert all([abs(c1) == abs(c2) for c1, c2 in zip(coeffs, coeffs[::-1])])
+            return coeffs
+
+        def __cnf(n: int) -> NDArray:
+            r"""Walsh-Fourier coefficients for CNF (OR) clauses.
+            $$
+            \widehat{\texttt{OR}}(S) = \left\lbrace
+            \begin{aligned}
+                &\frac{1}{2^{n-1}} - 1 & \abs{S} = 0 \\
+                &\frac{1}{2^{n-1}} & \abs{S} \neq 0
+            \end{aligned}\right.
+            $$
+            """
+            d = np.full(n + 1, 1 / (2 ** (n - 1)))
+            d[0] -= 1
             return d
 
-        # # e.g. clause $$c = \texttt{CARD}^{\geq 0}(x_1, x_2,\ldots)$$ is just $$FE_c = -1$$ (always SAT)
-        # if k == 0:
-        #     d[0] = -1
-        #     return d
+        def __eo(n: int) -> NDArray:
+            r"""Walsh-Fourier coefficients for exactly-one (EO) clauses.
+            $$
+            \widehat{\texttt{EO}}(S) = \left\lbrace
+            \begin{aligned}
+                &1-\frac{n}{2^{n-1}} & \abs{S} = 0 \\
+                &\frac{2\abs{S}-n}{2^{n-1}} & \abs{S} \neq 0
+            \end{aligned}\right.
+            $$
+            """
+            d = np.arange(-n, n + 1, 2, dtype=float) / (2 ** (n - 1))  # EO(S) = (2|S|-n)/2^(n-1)
+            d[0] = 1 - n / (2 ** (n - 1))
+            return d
 
-        # Calculate $$g(\rho) = (1+\rho)^{n-k}(1-\rho)^{k-1}$$, and reformulate for zeroes: $$(1-\rho) = -(\rho-1)$$
-        # Therefore $$g(\rho) = (\rho+1)^{n-k}(\rho-1)^{k-1}(-1)^{k-1}$$, and then multiply by combinatoric term.
-        noise_zeroes = np.array([-1] * (n - k) + [1] * (k - 1))
-        noise_poly = np.polynomial.polynomial.polyfromroots(noise_zeroes)
-        noise_poly *= (-1) ** ((k - 1) % 2)
-        numerators = np.array(comb(n - 1, k - 1, exact=True) * noise_poly)
+        def __nae(n: int) -> NDArray:
+            r"""Walsh-Fourier coefficients for not-all-equal (NAE) clauses.
+            For all even $$|S|$$, the coefficient at that size is $$(1/2)^{n-2}$$ due to cancellation of all even terms in $$g(\rho)$$,
+            and exactly $${n-1\choose |S|-1}$$ at all odd terms. This cancels the denominator in the general equation,
+            leaving a factor of 2. This happens to essentially align with the $$|S|=0$$ case, but subtract 1. Hence:
+            """
+            d = np.zeros(n + 1, dtype=float)
+            d[::2] = 1 / (2 ** (n - 2))
+            d[0] -= 1
+            return d
 
-        # The denominator for each $$|S|$$ has a $${n-1 \choose |S|-1}$$ term. Since each subsequent term in the series can be expressed
-        # as the product of the last term and the current term ($$i$$): $$(n-1)/(i+1)$$, we can save some time computing the
-        # m = (n-1)th row of Pascal's triangle (where the top is row 0) progressively (vectorised) vs calling comb().
-        m = n - 1
-        dtype = np.int64 if m <= 33 else np.object_
+        def __xor(n: int) -> NDArray:
+            r"""Walsh-Fourier coefficients for XOR clauses.
+            All zero expect for the full product of all literals (The nth ESP in n variables).
+            """
+            d = np.zeros(n + 1, dtype=float)
+            d[-1] = 1
+            return d
 
-        # The triangle is symmetric so we only need the left half of the row.
-        pascal_row = np.ones((m // 2) + 1, dtype=dtype)
-        pascal_row[1:] = np.arange(1, (m // 2) + 1, dtype=dtype)
+        def __amo(n: int) -> NDArray:
+            r"""Walsh-Fourier coefficients for at-most-one (AMO) clauses.
+            $$
+            \widehat{\texttt{AMO}}(S) = \left\lbrace
+            \begin{aligned}
+                &1-\frac{n-1}{2^{n-1}} & \abs{S} = 0 \\
+                &\frac{2\abs{S}-n-1}{2^{n-1}} & \abs{S} \neq 0
+            \end{aligned}\right.
+            $$
+            """
 
-        # Calculate the factorial numerator and denominators separately, and integer divide for stability.
-        # This implements the above recurrence for each subsequent term up to the midpoint of the triangle.
-        pascal_denoms = np.cumprod(pascal_row[1:], dtype=dtype)
-        np.cumprod((m + 1 - pascal_row[1:]), out=pascal_row[1:], dtype=dtype)
-        np.floor_divide(pascal_row[1:], pascal_denoms, out=pascal_row[1:])
+            d = np.arange(-n - 1, n, 2, dtype=float) / (2 ** (n - 1))
+            d[0] = 1 - (n + 1) / (2 ** (n - 1))
+            return d
 
-        # Flip and concat - offset in case of unique middle element - and finally scale by $$2^{n-1}$$
-        offset = (m - 1) % 2
-        pascal_row = np.concatenate([pascal_row, pascal_row[::-1][offset:]], dtype=dtype) * 2**m
+        def __card(n: int, k: int) -> NDArray:
+            r"""Walsh-Fourier coefficients for cardinality clauses.
+            This does not simplify to a clean closed form, so we require some manual computation.
+            The dominating step is polyfromroots, at $$O(n\cdot log^{2}(n))$$ for a clause of $$n$$ variables.
+            $$
+            \widehat{{\texttt{CARD}_{\geq k}}}(S) = \left\lbrace
+            \begin{aligned}
+                &1-\frac{\sum_{i=k}^{n}{n\choose i}}{2^{n-1}} & \abs{S} = 0 \\
+                &\frac{{n-1 \choose k-1}\left(g_{\texttt{CARD}}(\rho)\right)_{[p^{|S|-1}]}}{{n-1\choose |S|-1}2^{n-1}} & \abs{S} \neq 0
+            \end{aligned}\right.
+            $$
+            and $$ g_{\texttt{CARD}}(\rho) = (1+\rho)^{n-k}(1-\rho)^{k-1} $$
 
-        d[0] = 2 * binom.cdf(k - 1, n, 0.5) - 1
-        d[1:] = negate * (numerators / pascal_row)
-        return d
+            For $$n=k$$, e.g. clause $$c = \texttt{CARD}^{\geq n}(x_1, x_2,\ldots, x_n)$$ is just $$c = x_1 \land x_2 \land \ldots \land x_n$$.
+            Then $$g_{\texttt{CARD}} = (1-\rho)^{n-1}$$. The coefficients are just the  $$(n-1)$$th row of Pascal's triangle, 
+            with every second term negated, or... $$(-1)^{|S|-1}{n-1 \choose |S|-1}$$, cancelling out.
+            This means we get a simplified form:
+            $$
+            \widehat{{\texttt{CARD}_{*}}}(S) = \left\lbrace
+            \begin{aligned}
+                &1-\frac{1}{2^{n-1}} & \abs{S} = 0 \\
+                &\frac{(-1)^{|S|-1}}{2^{n-1}} & \abs{S} \neq 0
+            \end{aligned}\right.
+            $$
+            Having said this... there is merit to force reincoding this as n separate unit literals.
+            Notably those individual terms will be trivially minimisable. This form is distinctly not.
+            Also we need to still compute the full transformation in $$n$$ variables if we use this form.
+            For $$k=0$$ the clause is trivial and should be dropped instead of evaluated as well - e.g
+            clause $$c = \texttt{CARD}^{\geq 0}(x_1, x_2,\ldots)$$ is just $$FE_c = -1$$ (always SAT).
+            These are now handled in the loader itself, but for posterity:
+            $$n = k \Rightarrow$$ d = np.full(n + 1, (2 ** -(n - 1)), dtype=float); d[::2] *= -1; d[0] += 1
+            $$k=0\Rightarrow$$ d = np.zeros(n + 1, dtype=float); d[0] = -1
+            """
+            neg_k = k / (abs(k))
+            k = abs(k)
+            # Calculate $$g(\rho) = (1+\rho)^{n-k}(1-\rho)^{k-1}$$, and reformulate for zeroes: $$(1-\rho) = -(\rho-1)$$
+            # Therefore $$g(\rho) = (\rho+1)^{n-k}(\rho-1)^{k-1}(-1)^{k-1}$$, and then multiply by combinatoric term $${n-1 \choose k-1}$$
+            # We do this ourselves from the $$\pm1$$ roots for numeric stability.
+            coeff_numers = __int_noisepoly_numerators(n, k, neg_k)
 
-    def _wf_coeff(self, t: str, n: int, k: Opt[int] = None) -> Array:
-        """Calculate Walsh-Fourier coefficients for a given clause type."""
+            # The denominator for each $$|S|$$ has a $${n-1 \choose |S|-1}$$ term. Since each subsequent term in the series can be expressed
+            # as the product of the last term and the current term $$S_i$$: $$S_{i+1} = S_i\cdot(n-i)/(i+1)$$, we save time computing the
+            # m = (n-1)th row of Pascal's triangle (where the top is row 0) progressively (vectorised) vs calling comb()
+            # The triangle is left-right symmetric, so m//2+1 is enough. Stay with native int as long as possible.
+            m = n - 1
+            offset = (m - 1) % 2
+
+            # Calculate the factorial numerator and denominators separately, and integer divide for stability.
+            # This implements the above recurrence for each subsequent term up to the midpoint of the triangle.
+            # Then flip and concat - offset in case of unique middle element - and finally scale by $$2^{n-1}$$
+            pascal_idx = list(range(1, ((m // 2) + 1)))
+            pascal_denoms = list(accumulate(pascal_idx, ops.mul))  # cumprod (i*(i+1)*(i+2)...)
+            pascal_numers = list(accumulate([n - p for p in pascal_idx], ops.mul))  # cumprod ((n-1)*(n-2)*...)
+            coeff_denoms = [1] + [numer // denom for numer, denom in zip(pascal_numers, pascal_denoms)]
+            coeff_denoms = [coeff * (2**m) for coeff in (coeff_denoms + coeff_denoms[::-1][offset:])]
+
+            # Old numpy impl. Better to just stay in native infinite precision ints.
+            # dtype = np.object_ if n > 64 else np.int64
+            # pascal_numers = np.ones((m//2) + 1, dtype=dtype)
+            # pascal_denoms = np.cumprod(pascal_numers[1:], dtype=dtype)
+            # np.cumprod((m + 1 - pascal_numers[1:]), out=pascal_numers[1:], dtype=dtype)
+            # np.floor_divide(pascal_numers[1:], pascal_denoms, out=pascal_numers[1:])
+            # coeff_denoms = np.concatenate([coeff_denoms, coeff_denoms[::-1][offset:]], dtype=dtype) * 2**m
+            # d = np.zeros(n + 1, dtype=float)
+            # d[0] = 2 * binom.cdf(k - 1, n, 0.5) - 1
+            # d[1:] = (coeff_numers / coeff_denoms)
+            # assert all(np.abs(d[1:]) == np.abs(d[1:][::-1])) # Check symmetry
+
+            # Compute the coefficients and check symmetry once more up to signs.
+            coeffs = [numer / denom for numer, denom in zip(coeff_numers, coeff_denoms)]
+            assert all([abs(c1) == abs(c2) for c1, c2 in zip(coeffs, coeffs[::-1])])
+
+            d = np.array([2 * binom.cdf(k - 1, n, 0.5) - 1] + coeffs)
+            return d
+
         method_map = {
-            "cnf": self.__class__._wf_coeff_cnf,
-            "eo": self.__class__._wf_coeff_eo,
-            "nae": self.__class__._wf_coeff_nae,
-            "xor": self.__class__._wf_coeff_xor,
-            "amo": self.__class__._wf_coeff_amo,
-            "card": self.__class__._wf_coeff_card,
+            "cnf": __cnf,
+            "eo": __eo,
+            "nae": __nae,
+            "xor": __xor,
+            "amo": __amo,
+            "card": __card,
         }
 
-        if t not in method_map:
-            raise ValueError(f"Unknown clause type: {t}")
+        if sig.type not in method_map:
+            raise ValueError(f"Unknown clause type: {sig.type}")
 
-        if t == "card":
-            return method_map[t](n, k)
-        return method_map[t](n)
+        if sig.type == "card":
+            if sig.card:
+                return method_map[sig.type](sig.len, sig.card)
+            # Theoretically unreachable
+            raise ValueError("Cardinality clause without specified cardinality")
+        return method_map[sig.type](sig.len)
 
-    def _fft(self, clauses: list[Clause], n_devices: int = 1) -> tuple[FFT, Array, list[Clause]]:
-        dfts = []
-        idfts = []
-        del_list = []
-        unit_lits = set()
-
-        for idx, clause in enumerate(clauses):
-            t = clause.type
-            n = len(clause.lits)
-            k = clause.card
-
-            if t == "card":
-                # Flag, then correct or discard clauses that shouldn't be CARD.
-                if n == k:
-                    # flag for deletion, collect unit skips, and skip (handles the $$n=1$$ case)
-                    print(f"WARNING: Detected {n} unit literals encoded as a cardinality-{n} clause", file=sys.stderr)
-                    del_list.append(idx)
-                    for lit in clause.lits:
-                        unit_lits.add(lit)
-                    continue
-
-                if k == 0:
-                    print("WARNING: Detected cardinality 0 clause (trivially SAT)", file=sys.stderr)
-                    # flag for deletion and skip
-                    del_list.append(idx)
-                    continue
-
-                if k == 1:  # implicitly $$n>1$$ at this stage.
-                    # Change clause type if we aren't in a "CARD" specific clause group, very minor impact.
-                    #print("WARNING: Detected CNF encoded as cardinality-1 clause", file=sys.stderr)
-                    if self.clause_type != "card":
-                        t = "cnf"
-                        k = 0
-                        clauses[idx] = Clause(type=t, lits=clause.lits, card=k)
-
-            elif n == 1:
-                # Single literal clause
-                print(f"WARNING: Detected unit literal as {t} clause", file=sys.stderr)
-                del_list.append(idx)
-                unit_lits.add(clause.lits[0])
-                continue
-
-            if (t, n, k) in self.live_cache:
-                # fastest
-                clause_fft = self.live_cache[(t, n, k)]
-            elif (t, n, k) in self.disk_cache:
-                # check if computed in disk cache
-                clause_fft = self.disk_cache[(t, n, k)]
-                self.live_cache[(t, n, k)] = clause_fft
-            else:
-                # manual compute using closed form FWH Coefficients. 1/n applied to idft.
-                coeff = self._wf_coeff(t, n, k)
-                dft: Array = dft_table(n + 1)
-                idft = coeff[::-1] @ np.conjugate(dft) / (n + 1)
-                dft = dft[1].reshape(n + 1, 1)
-                clause_fft = FFT(dft, idft)
-                # update cachecs
-                self.live_cache[(t, n, k)] = clause_fft
-                if isinstance(self.do_fft, FFSATCache):
-                    self.do_fft.put((t, n, k), clause_fft)
-
-            dfts.append(clause_fft.dft)
-            idfts.append(clause_fft.idft)
-
-        for clause_idx in sorted(del_list, reverse=True):
-            clauses.pop(clause_idx)
-
-        dfts, dfts_mask = self._pad(dfts, n_devices=n_devices)
-        idfts, _ = self._pad(idfts, n_devices=n_devices)
-        return FFT(dft=jnp.array(dfts), idft=jnp.array(idfts)), jnp.array(dfts_mask), unit_lits
-
-    def _pad(self, arrays: list[Array | list[int]], pad_val: Opt[int] = 0, n_devices: int = 1) -> tuple[Array, Array]:
+    def _pad(self, arrays: list[NDArray | list[int]], pad_val: Opt[int] = 0) -> tuple[NDArray, NDArray]:
         arrays = [np.array(arr) if isinstance(arr, (list, int)) else arr for arr in arrays]
         rows = len(arrays)
-        extra_rows = n_devices - (rows % n_devices)
+        extra_rows = -rows % self.n_devices
         dtype = np.result_type(*arrays, pad_val)
 
         if arrays[0].ndim <= 1:
@@ -335,6 +272,10 @@ class ClauseGroup:
                 mask[i, :row_len] = True
 
         else:
+            try:
+                assert np.all([arr.ndim == arrays[0].ndim for arr in arrays])
+            except AssertionError as e:
+                raise e("All sub arrays must have same number of dimensions")
             max_dims = np.max([arr.shape for arr in arrays], axis=0)
             padded_shape = (rows + extra_rows, *max_dims)
             padded = np.full(padded_shape, pad_val, dtype=dtype)
@@ -345,24 +286,100 @@ class ClauseGroup:
                 padded[i][sl] = arr
                 mask[i][sl] = True
 
+        if np.all(mask):
+            mask = np.array([True], dtype=bool)
         return padded, mask
 
-    def process(self) -> None:
-        unit_lits = None
-        if self.do_fft:
-            self.ffts, dft_mask, unit_lits = self._fft(self.clauses, n_devices=self.n_devices)
-        self.clause_array = self._to_array(self.clauses, n_devices=self.n_devices)
-        if self.do_fft:
-            # Get mask. Broadcast extra dim for correct outer addition result shape=(k,n+1,n)
-            self.dft_mask = dft_mask & self.clause_array.mask[:, None, :]
-            # TODO:
-            # if self.update_diskcache:
-            #     self._update_diskcache()
-            print(self.clause_array.lits.shape, self.ffts.dft.shape, self.ffts.idft.shape, self.ffts.dft[0], self.ffts.idft[0])
-        return unit_lits
+    def __zero_if_close(self, arr: NDArray | Array, eps_tol_factor=100) -> NDArray | Array:
+        tol = eps_tol_factor * np.finfo(arr.dtype).eps
+        result = arr.copy()
+        result.real[np.abs(result.real) < tol] = 0.0
+        result.imag[np.abs(result.imag) < tol] = 0.0
+        return result
 
-    def get(self) -> Objective:
-        if self.do_fft:
-            return Objective(clauses=self.clause_array, ffts=self.ffts, forward_mask=self.dft_mask)
+    def _fft(self, signatures: list[ClauseSignature]) -> tuple[FFT, Array]:
+        dfts = []
+        idfts = []
+
+        for sig in signatures:
+            if sig in self.live_cache:
+                # fastest
+                clause_fft = self.live_cache[sig]
+            elif self.disk_cache and sig in self.disk_cache:
+                # check if computed in disk cache
+                clause_fft = self.disk_cache[sig]
+                self.live_cache[sig] = clause_fft
+            else:
+                # Compute FFT pair using closed form FWH Coefficients.
+                # Longer clauses need more precision, so we are forced to calculate the DFT manually.
+                coeffs = self._wf_coeffs(sig)[::-1]
+                scale = sig.len + 1
+                halfway = scale // 2 + 1
+                angles = [-2 * np.pi * Fraction(k, scale) for k in range(1, halfway)]
+                unities = [np.cos(angle) + 1j * np.sin(angle) for angle in angles]
+
+                dft = np.ones(scale, dtype=complex)
+                dft[1:halfway] = self.__zero_if_close(np.array(unities))
+                dft[halfway:] = np.conj(dft[1 : halfway - (sig.len) % 2][::-1])
+                dft = dft.reshape(-1, 1)
+
+                idft_powers = np.array([[(i * j) % scale for i in range(scale)] for j in range(scale)], dtype=int)
+                idft = np.conjugate(dft[idft_powers].squeeze())
+                idft = (coeffs @ idft) / scale
+                clause_fft = FFT(dft, idft)
+                # update caches
+                self.live_cache[sig] = clause_fft
+                if self.disk_cache:
+                    self.disk_cache.put(sig, clause_fft)
+
+            dfts.append(clause_fft.dft)
+            idfts.append(clause_fft.idft)
+
+        dfts, dfts_mask = self._pad(dfts)
+        idfts, _ = self._pad(idfts)
+        return FFT(dft=jnp.array(dfts), idft=jnp.array(idfts)), jnp.array(dfts_mask)
+
+    def _to_jax_array(self, signatures: list[ClauseSignature], clauses: list[Clauses]) -> ClauseArrays:
+        lits, mask = self._pad(clauses)
+
+        if np.all(lits > 0) or np.all(lits < 0):
+            sign = np.sign(lits.flatten()[0])
         else:
-            return Objective(clauses=self.clause_array)
+            sign = np.where(mask, np.sign(lits), 0)
+        sign = jnp.array(sign)
+
+        lits = np.where(mask, np.abs(lits) - 1, lits) #adjust for 0 indexing
+        lits = jnp.array(lits)
+        mask = jnp.array(mask)
+
+        types = [clause_type_ids[sig.type] for sig in signatures]
+        types, _ = self._pad([[t] for t in types])
+        types = jnp.array(types)
+
+        cards = [sig.card for sig in signatures]
+        cards, _ = self._pad([[c] for c in cards])
+        cards = jnp.array(cards)
+
+        return ClauseArrays(lits, sign, mask, types, cards)
+
+    def process(self, signatures: list[ClauseSignature], clauses: Clauses) -> Objective:
+        if len(signatures) > 1:
+            try:
+                assert len(signatures) == len(clauses)
+            except AssertionError as e:
+                raise (e("Heterogenous clause group must have equal number of clauses and signatures"))
+
+        clauses: ClauseArrays = self._to_jax_array(signatures, clauses)
+
+        ffts, dft_mask = self._fft(signatures)
+        # dfts = jnp.broadcast_to(ffts.dft, (clauses.lits.shape[0], max(ffts.dft.shape), 1))
+        # ffts = FFT(dft=dfts, idft=ffts.idft)
+        if jnp.all(dft_mask) and jnp.all(clauses.mask):
+            forward_mask = jnp.array([True], dtype=bool)
+        else:
+            forward_mask = dft_mask & clauses.mask[:, None, :]
+        # TODO:
+        # if self.update_diskcache:
+        #     self._update_diskcache()
+        print("Objective has", clauses.lits.shape[0], "clauses with signatures:", signatures)
+        return Objective(clauses=clauses, ffts=ffts, forward_mask=forward_mask)

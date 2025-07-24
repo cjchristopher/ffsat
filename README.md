@@ -126,26 +126,13 @@ python ff_shard_test.py input_file.cnf [options]
 
 ### Command Line Options
 
-- `-m, --mode INT`: Clause partitioning mode (default: 0, prompts after reading input)
 - `-t, --timeout INT`: Maximum runtime in seconds (default: 300)
-- `-b, --batch INT`: Batch size per GPU (default: 16)
+- `-b, --batch INT`: Batch size for a single GPU (default: -1 = determine dynamically)
 - `-r, --restart INT`: Points to test before adjusting weights and restarting (default: 0, no restart)
 - `-f, --fuzz INT`: Number of fuzzing attempts per batch (default: 0)
 - `-v, --vertex`: Start optimization near vertices
-- `-c, --combine`: Optimize batch points with a single optimizer call
 - `-p, --profile`: Enable profiling
-
-### Clause Partitioning Modes
-
-The `-m, --mode` parameter controls how clauses are partitioned for processing:
-
-- **Mode 1 (Full combine - 1 group)**: Uses a single monolithic array with all clauses appropriately padded. If clause lengths are varied then this produces the most memory overhead, but may speed up optimisation.
-
-- **Mode 2 (By type - at most 6 groups)**: Creates separate padded arrays for each clause type. Has similar drawbacks to the above, in that wide variation in the clause length may cause a a high memory overhead for padding
-
-- **Mode 3 (By length - no limit)**: Creates separate arrays for each clause length. For memory constrained environments, this trades off some optimisation efficiency for zero additional memory requirement above baseline. In future a variation threshold that allows groups clause lengths to a mode within some range (for minimal padding) may be added.
-
-If mode is not specified (or set to 0), the solver will analyze the input file and prompt you to select a partitioning strategy.
+- `-d, --debug STR`: Enable debugging - STR is one of DEBUG, INFO, WARNING, ERROR, CRITICAL
 
 ### Examples
 
@@ -154,19 +141,14 @@ Basic usage:
 python ff_shard_test.py problem.cnf
 ```
 
-Running with a 10-minute timeout and larger batch size:
+Running with a 10-minute timeout and specific batch size:
 ```bash
 python ff_shard_test.py problem.cnf -t 600 -b 32
 ```
 
-Enable vertex initialization and fuzzing:
+Enable five fuzzing passes before moving on to next batch:
 ```bash
-python ff_shard_test.py problem.cnf -v -f 5
-```
-
-Use type-based partitioning for a mixed constraint problem:
-```bash
-python ff_shard_test.py problem.cnf -m 2 -t 600
+python ff_shard_test.py problem.cnf -f 5
 ```
 
 ## Output
