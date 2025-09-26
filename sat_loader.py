@@ -15,13 +15,14 @@ class UnsatError(Exception):
 
 
 class PBSATFormula(object):
-    def __init__(self, max_workers: int = 1, n_devices: int = 1, disk_cache: str = None) -> None:
+    def __init__(self, workers: int = 1, n_devices: int = 1, disk_cache: str = None, benchmark: bool = False) -> None:
         self.clauses: dict[ClauseSignature, Clauses] = {}
         self.n_var = 0
         self.n_clause = 0
         self.n_devices = n_devices
-        self.max_workers = max_workers
+        self.workers = workers
         self.disk_cache = disk_cache
+        self.benchmark = benchmark
 
     def read_DIMACS(self, dimacs_file: str) -> None:
         """
@@ -196,20 +197,20 @@ class PBSATFormula(object):
             padded_sigs, padded_clause_lists = zip(*padded_group)
             clause_grps.append(ClauseGroup(padded_sigs, padded_clause_lists))
 
-        def parallel_clause_process(clause_grps: list[ClauseGroup], max_workers: Opt[int] = None) -> list[Objective]:
+        def parallel_clause_process(clause_grps: list[ClauseGroup], workers: Opt[int] = None) -> list[Objective]:
             processor = ClauseProcessor(self.n_devices, self.disk_cache)
 
             res: list[Objective] = []
-            with ThreadPoolExecutor(max_workers=max_workers) as tpool:
-                tasks = [tpool.submit(processor.process, grp.sigs, grp.clauses) for grp in clause_grps if grp]
+            with ThreadPoolExecutor(max_workers=workers) as tpool:
+                tasks = [tpool.submit(processor.process, grp.sigs, grp.clauses, self.benchmark) for grp in clause_grps if grp]
                 for task in tasks:
                     res.append(task.result())
 
             return res
 
         # N.B. Using multiple works can cause XLA cache conflicts if using "all" persistent caches.
-        # All is broken for some jaxopt optimizers however, so we don't use it. If we do, max_workers should be 1 to avoid
+        # All is broken for some jaxopt optimizers however, so we don't use it. If we do, workers should be 1 to avoid
         # race conditions deep in XLA (see jax.config.update("jax_persistent_cache_enable_xla_caches", "all"))
-        objectives = parallel_clause_process(clause_grps, max_workers=min(len(clause_grps), self.max_workers))
+        objectives = parallel_clause_process(clause_grps, workers=min(len(clause_grps), self.workers))
         objectives = tuple(sorted(objectives, key=lambda x: x.clauses.lits.shape[-1]))
         return objectives
