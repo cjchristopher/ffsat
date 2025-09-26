@@ -257,7 +257,21 @@ class ClauseProcessor:
     def _pad(self, arrays: list[NDArray | list[int]], pad_val: Opt[int] = 0) -> tuple[NDArray, NDArray]:
         arrays = [np.array(arr) if isinstance(arr, (list, int)) else arr for arr in arrays]
         rows = len(arrays)
-        extra_rows = -rows % self.n_devices
+        if rows > 1:
+            #extra_rows = -rows % self.n_devices
+            # TODO: Think about how to handle heterogeneous clause sets when objective sharding is required?
+            # N.B. If we ever need to shard objectives then the above will be required for hetero batches.
+            # For homogenous batches (1 signature), we would need to adjust the shard spec
+            # This would indicate the mesh and shard spec should be the first thing we do and should
+            # get passed through to this stage.
+            # Or perhaps we just call _pad when we are doing the batch size detection. If we determine
+            # that objective sharding is relevant, then we can pad then? Notably, we already
+            # use n_devices here, so sequencing is something to think about.
+            # This will affect types and cards as well. Those leaves will need replication for homogenous
+            # objectives, instead of sharding. A fully heterogeneous batch will need sharding at all leaves.
+            extra_rows = 0
+        else:
+            extra_rows = 0
         dtype = np.result_type(*arrays, pad_val)
 
         if arrays[0].ndim <= 1:
@@ -350,7 +364,7 @@ class ClauseProcessor:
 
         lits = np.where(mask, np.abs(lits) - 1, lits) #adjust for 0 indexing
         lits = jnp.array(lits)
-        mask = jnp.array(mask)
+        mask = jnp.atleast_2d(jnp.array(mask))
 
         types = [clause_type_ids[sig.type] for sig in signatures]
         types, _ = self._pad([[t] for t in types])
@@ -362,7 +376,7 @@ class ClauseProcessor:
 
         return ClauseArrays(lits, sign, mask, types, cards)
 
-    def process(self, signatures: list[ClauseSignature], clauses: Clauses) -> Objective:
+    def process(self, signatures: list[ClauseSignature], clauses: Clauses, benchmark: bool) -> Objective:
         if len(signatures) > 1:
             try:
                 assert len(signatures) == len(clauses)
@@ -377,9 +391,11 @@ class ClauseProcessor:
         if jnp.all(dft_mask) and jnp.all(clauses.mask):
             forward_mask = jnp.array([True], dtype=bool)
         else:
+            print("Heterogeneous masks", dft_mask.shape, clauses.mask.shape)
             forward_mask = dft_mask & clauses.mask[:, None, :]
         # TODO:
         # if self.update_diskcache:
         #     self._update_diskcache()
-        print("Objective has", clauses.lits.shape[0], "clauses with signatures:", signatures)
+        if not benchmark:
+            print("Processed objective has", clauses.lits.shape[0], "clauses with signature(s):", signatures)
         return Objective(clauses=clauses, ffts=ffts, forward_mask=forward_mask)
