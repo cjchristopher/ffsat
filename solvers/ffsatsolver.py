@@ -77,7 +77,7 @@ def build_eval_verify(objs: tuple[Objective, ...]) -> tuple[tuple[Evaluator, ...
                             ),
         }
 
-        def evaluate(x: Array, weight: Array) -> Array:
+        def evaluate(x: Array, fixed_vars: Array, weight: Array) -> Array:
             #TODO: Create an eval_rules dict (like above) that only applies the full transform
             # for clause types that need it. e.g. XOR can be shortcut substantially if we close over the types.
             #@jax.checkpoint
@@ -88,13 +88,15 @@ def build_eval_verify(objs: tuple[Objective, ...]) -> tuple[tuple[Evaluator, ...
                 esp_freq = jnp.prod(fourier_domain, axis=-1, where=forward_mask)
                 return esp_freq                                                   # (N,(K+1))
 
+            x = jnp.where(fixed_vars, jax.lax.stop_gradient(x), x)
             #assignment = sign * x[lits]                                          # (N,K) * (N,K) = (N,K)
             esp_freq = fourier_checkpoint(x)#assignment)                          # (N,(K+1))
             esp_eval = idft * esp_freq                                            # (1,(K+1)) * (N,(K+1)) = (N,(K+1))
             clause_eval = jnp.sum(esp_eval.real, axis=-1)                         # (N,)
             weighted_eval = weight * clause_eval                                  # (N,) * (N,) = (N,)
             x_eval = jnp.sum(weighted_eval, axis=-1)                              # (1,)
-
+            # x_anomaly = jnp.abs(weighted_eval)>1
+            # jax.debug.print("Clause anomaly: {}, {}, {}", lits.shape, types, jnp.argwhere(x_anomaly, size=10), ordered=True)
             return jnp.atleast_1d(x_eval)
         # fmt: on
 
@@ -122,12 +124,14 @@ def seq_eval_verify(evaluators: tuple[Evaluator], verifiers: tuple[Verifier]) ->
     Groups a collection (usually all) of Evaluators & Verifiers into a sequence.
     """
 
-    def seq_evals(x: Array, weights: tuple[Array]) -> tuple[Array, Array]:
-        costs = [evaluate(x, weight) for (evaluate, weight) in zip(evaluators, weights)]
+    def seq_evals(x: Array, fixed_vars: Array, weights: tuple[Array]) -> tuple[Array, Array]:
+        costs = [evaluate(x, fixed_vars, weight) for (evaluate, weight) in zip(evaluators, weights)]
         cost = jnp.sum(jnp.array(costs))
-        return cost, cost  # aux info - remove when consolidating
+        # x_anomaly = jnp.abs(cost)>2460
+        # jax.debug.print("Cost anomaly {}", jnp.argwhere(x_anomaly, size=10), ordered=True)
+        return cost, (x, cost)  # returns costs in aux for breakdown by objective. aux info - remove when consolidating
 
-    def seq_verifies(x: Array) -> Array:
+    def seq_verifies(x: Array) -> tuple[Array,...]:
         all_res = [verify(x) for verify in verifiers]
         res = jnp.concat(all_res, axis=-1)
         return res
@@ -153,9 +157,9 @@ class FFSatSolver(abc.ABC):
                 if not benchmark:
                     print("Setting up JAXOPT L-BFGS-B:", type(self.solver))
 
-                def opt(x: Array, weights: list[Array]) -> tuple[Array, Array, Array, Array]:
+                def opt(x: Array, fixed_vars: Array, weights: list[Array]) -> tuple[Array, Array, Array, Array]:
                     bounds = (-1 * jnp.ones_like(x), jnp.ones_like(x))
-                    x_opt, state = self.solver.run(x, weights=weights, bounds=bounds)
+                    x_opt, state = self.solver.run(x, fixed_vars=fixed_vars, weights=weights, bounds=bounds)
                     unsat = jnp.squeeze(verifier(x_opt))
                     return x_opt, unsat, jnp.atleast_1d(state.iter_num), state.aux
 
@@ -164,9 +168,9 @@ class FFSatSolver(abc.ABC):
                 if not benchmark:
                     print("Setting up JAXOPT ScipyBounded L-BFGS-B")
 
-                def opt(x: Array, weights: list[Array]) -> tuple[Array, Array, Array, Array]:
+                def opt(x: Array, fixed_vars: Array, weights: list[Array]) -> tuple[Array, Array, Array, Array]:
                     bounds = (-1 * jnp.ones_like(x), jnp.ones_like(x))
-                    x_opt, state = self.solver.run(x, weights=weights, bounds=bounds)
+                    x_opt, state = self.solver.run(x, fixed_vars=fixed_vars, weights=weights, bounds=bounds)
                     unsat = jnp.squeeze(verifier(x_opt))
                     return x_opt, unsat, jnp.atleast_1d(state.iter_num), state.fun_val
 
@@ -175,18 +179,18 @@ class FFSatSolver(abc.ABC):
                 if not benchmark:
                     print("Setting up JAXOPT Projected Gradient (Box)")
 
-                def opt(x: Array, weights: list[Array]) -> tuple[Array, Array, Array, Array]:
-                    x_opt, state = self.solver.run(x, weights=weights, hyperparams_proj=(-1, 1))
+                def opt(x: Array, fixed_vars: Array, weights: list[Array]) -> tuple[Array, Array, Array, Array]:
+                    x_opt, state = self.solver.run(x, fixed_vars=fixed_vars, weights=weights, hyperparams_proj=(-1, 1))
                     unsat = jnp.squeeze(verifier(x_opt))
                     return x_opt, unsat, jnp.atleast_1d(state.iter_num), state.aux
 
             else:
                 pass
 
-            def vectorise(xs: Array, weights: tuple[Array]) -> tuple[Array, Array, Array, Array, Array]:
-                x_opt, unsat, iters, evals = jax.vmap(opt, in_axes=(0, None))(xs, weights)
+            def vectorise(xs: Array, fixed_vars: Array, weights: tuple[Array]) -> tuple[Array, Array, Array, Array, Array]:
+                x_opt, unsat, iters, evals = jax.vmap(opt, in_axes=(0, 0, None))(xs, fixed_vars, weights)
                 #jax.debug.print("min/max evals {}, {}, {}", jnp.min(evals), jnp.max(evals), evals.shape)
-                unsat_cl_count = jnp.sum(jnp.atleast_1d(unsat), axis=0)
+                unsat_cl_count = jnp.sum(jnp.atleast_1d(unsat), axis=1)
                 return x_opt, jnp.atleast_2d(unsat), iters, unsat_cl_count, evals
 
             self.run = jax.jit(vectorise, donate_argnums=(0))
@@ -206,15 +210,15 @@ class FFSatSolver(abc.ABC):
             if not benchmark:
                 print("Setting up ScipyBounded L-BFGS-B (CPU) with JIT'd eval+verify (GPU)")
             _, _, eval_fun = job._make_funs_without_aux(fun=evaluator, value_and_grad=False, has_aux=True)
-            v_eval_fun = jax.jit(jax.vmap(eval_fun, in_axes=(0, None)))
+            v_eval_fun = jax.jit(jax.vmap(eval_fun, in_axes=(0, 0, None)))
             v_verifier = jax.jit(jax.vmap(verifier, in_axes=(0)))
             self.eval_fun = v_eval_fun
 
-            def opt_ver_vectorise(x: Array, weights: list[Array]) -> tuple[Array, Array, Array, Array]:
+            def full_vectorise(x: Array, fixed_vars: Array, weights: list[Array]) -> tuple[Array, Array, Array, Array]:
                 def flat(x0: np.ndarray) -> float:
                     # Convert back to JAX arrays, run on GPU, return CPU results to minimize.
                     x0 = jnp.array(x0).reshape(x.shape)
-                    v, g = v_eval_fun(x0, weights)  # this is eval.
+                    v, g = v_eval_fun(x0, fixed_vars, weights)  # this is eval.
                     return float(jnp.sum(v)), np.array(g.flatten())
 
                 x0 = np.array(x.flatten())
@@ -222,20 +226,22 @@ class FFSatSolver(abc.ABC):
                 options = {"maxiter": self.maxiter}
                 res: OptimizeResult = ScipyMinimize(flat, x0, bounds=bounds, jac=True, options=options)
                 x_opt = jnp.array(res.x).reshape(x.shape)
-                unsat = jnp.squeeze(s_verifier(x_opt))
+                unsat = jnp.squeeze(v_verifier(x_opt))
                 unsat_cl_count = jnp.sum(jnp.atleast_1d(unsat), axis=0)
                 return x_opt, unsat, jnp.array([res.nit]), unsat_cl_count, jnp.array(res.aux)
 
-            self.run = opt_ver_vectorise
+            self.run = full_vectorise
 
         else:
             pass
 
-    def peak_memory_estimation(self, dummy_data: tuple[Array, list[Array]] = None) -> int:
-        x0, weights = dummy_data
+    def peak_memory_estimation(self, dummy_data: tuple[Array, Array, list[Array]] = None) -> int:
+        x0, fixed_vars, weights = dummy_data
         runner = self.run if self.sol_name not in ["sp-lbfgsb"] else self.eval_fun
-        lowered = self.run.lower(x0, weights)
-        analysis = lowered.compile().memory_analysis()
+        traced = self.run.trace(x0, fixed_vars, weights)
+        lowered = traced.lower()
+        compiled = lowered.compile()
+        analysis = compiled.memory_analysis()
 
         # pref = f"{str(x0.shape[0]) + "    ":<9}"
         # print(f"{'Batch Sz':<9} | {'Temp Sz':<9} | {'Arg Sz':<9} | {'Out Sz':<9} | {'Alias Sz':<9}")
@@ -243,21 +249,24 @@ class FFSatSolver(abc.ABC):
         #         + f"{analysis.output_size_in_bytes:<9} | {analysis.alias_size_in_bytes:<9}")
         peak_est = analysis.temp_size_in_bytes + analysis.argument_size_in_bytes \
                     + analysis.output_size_in_bytes - analysis.alias_size_in_bytes
-        # with open("b_" + f"{x0.shape[0]:06}" + "_jax" + jax.__version__ + ".hlo", 'w') as f:
+        with open("b_" + f"{x0.shape[0]:06}" + "_jax" + jax.__version__ + ".hlo", 'w') as f:
+            f.write(str(peak_est) + "\n")
+            f.write(lowered.as_text())
+        # with open("b_" + f"{x0.shape[0]:06}" + "_jax" + jax.__version__ + ".jaxpr", 'w') as f:
         #     f.write(str(peak_est) + "\n")
-        #     f.write(lowered.as_text())
-        print(x0.shape[0], peak_est)
+        #     f.write(str(traced.jaxpr))
+        print(x0.shape[0], peak_est, "FLOPS", compiled.cost_analysis()['flops'])
         return int(peak_est)
 
-    def warmup(self, warmup_data: tuple[Array, list[Array]] = None, counting: bool = False):
+    def warmup(self, warmup_data: tuple[Array, Array, list[Array]] = None, counting: bool = False):
         if warmup_data:
             runner = self.run if self.sol_name not in ["sp-lbfgsb"] else self.eval_fun
-            x0, weights = warmup_data
-            batch = x0.shape[0]
+            x0, fixed_vars, weights = warmup_data
+            # batch = x0.shape[0]
             if not self.benchmark:
                 print("Warmup Run (Dummy Data Compilation)")
             t0 = time()
-            opt_x0, opt_unsat, opt_iters, opt_unsat_ct, eval_scores = runner(x0, weights)
+            opt_x0, opt_unsat, opt_iters, opt_unsat_ct, eval_scores = runner(x0, fixed_vars, weights)
             if not counting:
                 batch_unsat_scores = jnp.sum(opt_unsat, axis=1)
                 batch_best = jnp.min(batch_unsat_scores)
@@ -266,7 +275,7 @@ class FFSatSolver(abc.ABC):
 
                 found_sol = False
                 if batch_best == 0:
-                    #print("Found a solution in warmup! SAT at index {}".format(loc))
+                    print("Found a solution in warmup! SAT at index {}".format(loc))
                     out_string = "v"
                     assignment = []
                     for i in range(x0.shape[-1]):
