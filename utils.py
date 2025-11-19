@@ -49,3 +49,5 @@ class FFSATConfig:
         """Save configuration to a JSON file."""
         with open(filepath, "w") as f:
             json.dump(self.__dict__, f, indent=2)
+
+

@@ -6,6 +6,7 @@ from typing import NamedTuple
 from typing import Optional as Opt
 
 from boolean_whf import Clause, ClauseProcessor, Clauses, ClauseSignature, Objective, clause_type_ids
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -16,7 +17,7 @@ class UnsatError(Exception):
 
 class PBSATFormula(object):
     def __init__(self, workers: int = 1, n_devices: int = 1, disk_cache: str = None, benchmark: bool = False) -> None:
-        self.clauses: dict[ClauseSignature, Clauses] = {}
+        self.clause_sets: dict[ClauseSignature, Clauses] = {}
         self.n_var = 0
         self.n_clause = 0
         self.n_devices = n_devices
@@ -139,7 +140,7 @@ class PBSATFormula(object):
                                 logger.warning(f"Line {idx}: Adjusting {n} unit literals enoded as CARD-{n}: {line}")
                                 for lit in lits:
                                     sig = ClauseSignature("cnf", clause_len, card)
-                                    self.clauses.setdefault(sig, []).append(lit)
+                                    self.clause_sets.setdefault(sig, []).append(lit)
                                 continue
 
                             if card == 0:
@@ -152,9 +153,11 @@ class PBSATFormula(object):
                                 card = 0
 
                         sig = ClauseSignature(clause_type, clause_len, card)
-                        self.clauses.setdefault(sig, []).append(lits)
+                        self.clause_sets.setdefault(sig, []).append(lits)
 
-                print(f"Successfully processed file: {dimacs_file}, with {len(self.clauses)} objectives (clause sets)")
+                print(f"Processed file: {dimacs_file}, with {len(self.clause_sets)} objectives (clause sets)"
+                      f" - a total {self.n_clause} clauses over {self.n_var} variables "
+                      )
         except FileNotFoundError as e:
             print(f"Error: File '{dimacs_file}' not found")
             raise e
@@ -175,7 +178,7 @@ class PBSATFormula(object):
         singletons_by_len: dict[int, list[Singleton]] = dict()
         padded_group: list[Singleton] = list()
 
-        for clause_sig, clause_list in self.clauses.items():
+        for clause_sig, clause_list in self.clause_sets.items():
             # Gather singletons by common length for more efficient processing
             if len(clause_list) == 1:
                 singletons_by_len.setdefault(clause_sig.clen, []).append(Singleton(clause_sig, clause_list[0]))
@@ -214,3 +217,29 @@ class PBSATFormula(object):
         objectives = parallel_clause_process(clause_grps, workers=min(len(clause_grps), self.workers))
         objectives = tuple(sorted(objectives, key=lambda x: x.clauses.lits.shape[-1]))
         return objectives
+
+    def process_prefix(self, prefix_file: str) -> tuple[list[np.ndarray], list[np.ndarray]]:
+        try:
+            vecs = []
+            with open(prefix_file, "r") as f:
+                for idx, line in enumerate(f):
+                    lits = line.strip().split()
+                    if lits[0] in ("c", "#", "*"):
+                        continue
+                    vec = np.zeros(self.n_var+1, dtype=int)
+                    try:
+                        lit_vec = np.array([int(lit) for lit in lits], dtype=int)
+                        vec[abs(lit_vec[lit_vec<0])] = 1
+                        vec[abs(lit_vec[lit_vec>0])] = -1
+                        vecs.append(vec.copy())
+                    except ValueError:
+                        logger.warning(f"Line {idx}: Invalid prefix entry: {line.strip()}")
+                        continue
+            prefixes = np.delete(np.stack(vecs), 0, axis=1)
+            return prefixes
+        except FileNotFoundError as e:
+            print(f"Error: File '{prefix_file}' not found")
+            raise e
+        except Exception as e:
+            print(f"Error processing prefix file: {e}")
+            raise e
