@@ -8,6 +8,7 @@ import sys
 from argparse import ArgumentParser as ArgParse
 from contextlib import nullcontext
 from time import perf_counter as time
+from collections import Counter
 
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"  # Disable pre-allocation
 os.environ["XLA_CLIENT_MEM_FRACTION"] = "0.95"  # Use full memory allocation
@@ -38,9 +39,11 @@ import jax.numpy as jnp
 import numpy as np
 from jax import Array
 from jax.sharding import Mesh, NamedSharding, AxisType
+from jax_array_info import sharding_info, sharding_vis, simple_array_info, print_array_stats, pretty_memory_stats
 from typing import Optional as Opt
 from typing import TypeAlias
 from tqdm import tqdm
+from sparklines import sparklines
 
 from contextlib import nullcontext
 from boolean_whf import Objective
@@ -55,7 +58,7 @@ jax.config.update("jax_use_shardy_partitioner", True)
 jax.config.update("jax_memory_fitting_level", "O3")
 jax.config.update("jax_optimization_level", "O3")
 jax.config.update("jax_compiler_enable_remat_pass", True)
-jax.config.update("jax_compilation_cache_dir", "/tmp/jax-cache")
+jax.config.update("jax_compilation_cache_dir", "/g/data/y08/cjc659/jax-cache")
 jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
 jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
 #jax.config.update("jax_persistent_cache_enable_xla_caches", "all")
@@ -80,9 +83,9 @@ jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
 # jaxlog.propagate = False
 
 print = functools.partial(print, flush=True)
-ShardSpec: TypeAlias = Opt[tuple[NamedSharding, tuple[NamedSharding, ...]]]
+ShardSpec: TypeAlias = tuple[NamedSharding, tuple[NamedSharding, ...]]
 
-def x0_guesses(rng_key: Array, batch: int, n_vars: int, method: str = "bias", prefixes: Array = None) -> Array:
+def x0_guesses(rng_key: Array, batch: int, n_vars: int, method: str = "bias", prefixes: Array = None) -> tuple[Array, Array]:
     """
     Generates initial guesses for variable assignments in SAT problems using different randomization methods.
 
@@ -125,6 +128,7 @@ def x0_guesses(rng_key: Array, batch: int, n_vars: int, method: str = "bias", pr
         raise ValueError(f"Unsupported method: {method}")
 
     # Fix positions of supplied prefixes from classical SAT solver.
+    fixed_mask = jnp.full((batch, 1), fill_value=False, dtype=bool) #
     if prefixes is not None:
         N = prefixes.shape[0]
         # Batch is already correctly sized equal points for each prefix.
@@ -133,9 +137,9 @@ def x0_guesses(rng_key: Array, batch: int, n_vars: int, method: str = "bias", pr
         # Non-zero points are fixed, so adjust batch and disable gradients there.
         fixed_mask = (replicated_prefixes != 0)
         x0 = jnp.where(fixed_mask, replicated_prefixes, x0)
-        x0 = jnp.where(fixed_mask, jax.lax.stop_gradient(x0), x0)
+        # x0 = jnp.where(fixed_mask, jax.lax.stop_gradient(x0), x0)
 
-    return x0
+    return x0, fixed_mask
 
 
 def shard_objective(target: Objective | tuple[Array], sharding: NamedSharding) -> Array | tuple[Array]:
@@ -182,14 +186,15 @@ def adjust_batch(devices: list, batch: int, est_mem_per_point: int, n_prefix: in
     n_device = len(devices)
     max_gpu_mem = devices[0].memory_stats()["bytes_limit"] - devices[0].memory_stats()["bytes_in_use"]*2
     max_batch = max_gpu_mem//est_mem_per_point
+    opt_batch = int(max_gpu_mem*0.01)//est_mem_per_point
 
     pad = " "*(len(str(batch))+4)
     #print(pad + "Mem per batch element:", max_gpu_mem, max_batch, "(", devices[0].memory_stats()["bytes_in_use"]*2)
 
     if batch == -1 or batch > max_batch:
         print("Adjusting per-device batch size (either none specified to batch too large):")
-        print(f"Set to {max_batch} p.d. (total {max_batch * n_device}) from {batch} (theoretical max {max_batch})")
-        batch = (max_batch//2) * n_device
+        print(f"Set to {opt_batch} p.d. (total {opt_batch * n_device}) from {batch} (theoretical max {max_batch})")
+        batch = opt_batch * n_device
     else:
         batch = batch * n_device
 
@@ -214,7 +219,7 @@ def run_solver(
     n_vars: int,
     n_clause: int,
     batch: int,
-    restart: int,
+    restart_thresh: int,
     fuzz_limit: int,
     objectives: tuple[Objective, ...],
     n_devices: int = 1,
@@ -229,6 +234,7 @@ def run_solver(
     q_bench: int = 0,
 ) -> float:
     devices = jax.devices("gpu")[:n_devices]
+    n_prefix = len(prefix_vectors) if prefix_vectors is not None else 1
 
     mesh, objective_sharding, batch_sharding = get_mesh(devices)
     jax.sharding.set_mesh(mesh)
@@ -241,9 +247,10 @@ def run_solver(
     # Construct pure JAX functions (closures) and build solver.
     obj_evaluators, obj_verifiers = build_eval_verify(objectives)
     evaluator, verifier = seq_eval_verify(obj_evaluators, obj_verifiers)
-    solver = FFSatSolver(evaluator, verifier, sol_name, maxiter=20, bench=benchmark)
+    solver = FFSatSolver(evaluator, verifier, sol_name, benchmark=benchmark, maxiter=25)
 
     seed = int(time()) if rand_seed else 0
+    print(seed, rand_seed)
     key = jax.random.PRNGKey(np.array(seed))
     f_key = jax.random.PRNGKey(np.array(seed + 1))
 
@@ -254,32 +261,79 @@ def run_solver(
         total_gpu_mem = devices[0].memory_stats()["bytes_limit"]
         dt_sz = jnp.dtype(objectives[0].ffts.dft.dtype).itemsize
         total_obj_mem = sum([np.prod([max(o.clauses.lits.shape), max(o.ffts.dft.shape) ** 2, dt_sz]) for o in objectives])
-        batch = int(np.floor(total_gpu_mem / (total_obj_mem)))
-        batch += batch % 2
+        # print([np.prod([max(o.clauses.lits.shape), max(o.ffts.dft.shape) ** 2, dt_sz]) for o in objectives])
+        guess_batch = int(np.floor(total_gpu_mem / (total_obj_mem)))
+        guess_batch -= guess_batch % n_devices
+        print("initial guess", guess_batch)
+    else:
+        guess_batch = 0
 
-    # Generate arrays and check peak memory estimation.
-    if q_bench < 2: # 2 implies we have already worked out the upper limit
-        noise = jax.random.uniform(f_key, maxval=5e-2, shape=(batch, n_vars))
-        dummy_batch = batch
-        x_dummy = jax.device_put(jnp.full((batch, n_vars), fill_value=0.99, dtype=float) - noise, batch_sharding)
+    ### EVAL ONLY KERNAL
+    # if batch == -1:
+    #     print("\t#### EVAL ONLY STATS #####")
+    #     jit_eval = jax.jit(jax.vmap(evaluator, in_axes=(0, 0, None)))
+    #     # noise = jax.random.uniform(f_key, maxval=5e-2, shape=(guess_batch, n_vars))
+    #     # x_dummy = jax.device_put(jnp.full((guess_batch, n_vars), fill_value=0.99, dtype=float) - noise, batch_sharding)
+    #     x_dummy = jax.device_put(jax.random.uniform(f_key, minval=0.99-(5e-2), maxval=0.99, shape=(guess_batch, n_vars)))
+    #     fixed_vars = jax.device_put(jnp.full((guess_batch, 1), fill_value=False, dtype=bool), batch_sharding)
+    #     w_dummy = [w - 0.00001 for w in weights]
+
+    #     traced = jit_eval.trace(x_dummy, fixed_vars, w_dummy)
+    #     lowered = traced.lower()
+    #     compiled = lowered.compile()
+    #     analysis = compiled.memory_analysis()
+    #     peak_mem = analysis.temp_size_in_bytes + analysis.argument_size_in_bytes \
+    #                 + analysis.output_size_in_bytes - analysis.alias_size_in_bytes
+    #     mem_est_per_point = peak_mem // guess_batch
+
+    #     print(f"\tinitial guess $ shape: {x_dummy.shape}, peak-est: {peak_mem}, peak/point: {mem_est_per_point}")
+    #     e_guess_batch = adjust_batch(devices, batch, mem_est_per_point, n_prefix)
+
+    #     # noise = jax.random.uniform(f_key, maxval=5e-2, shape=(e_guess_batch, n_vars))
+    #     # x_dummy = jax.device_put(jnp.full((guess_batch, n_vars), fill_value=0.99, dtype=float) - noise, batch_sharding)
+    #     x_dummy = jax.device_put(jax.random.uniform(f_key, minval=0.99-(5e-2), maxval=0.99, shape=(e_guess_batch, n_vars)), batch_sharding)
+    #     fixed_vars = jax.device_put(jnp.full((e_guess_batch, 1), fill_value=False, dtype=bool), batch_sharding)
+    #     w_dummy = [w - 0.00001 for w in weights]
+
+    #     traced = jit_eval.trace(x_dummy, fixed_vars, w_dummy)
+    #     lowered = traced.lower()
+    #     compiled = lowered.compile()
+    #     analysis = compiled.memory_analysis()
+    #     peak_mem = analysis.temp_size_in_bytes + analysis.argument_size_in_bytes \
+    #                 + analysis.output_size_in_bytes - analysis.alias_size_in_bytes
+    #     mem_est_per_point = peak_mem // e_guess_batch
+    #     print(f"\tmaximum guess $ shape: {x_dummy.shape}, peak-est: {peak_mem}, peak/point: {mem_est_per_point}")
+    #     print("\tflops:", compiled.cost_analysis()['flops'])
+    #     print("\t#### EVAL ONLY STATS #####")
+
+
+    # Generate arrays and check peak memory estimation. #q_bench and 
+    if batch==-1 or (q_bench and q_bench < 2): # 2 implies we have already worked out the upper limit
+        # noise = jax.random.uniform(f_key, maxval=5e-2, shape=(guess_batch, n_vars))
+        # x_dummy = jax.device_put(jnp.full((guess_batch, n_vars), fill_value=0.99, dtype=float) - noise, batch_sharding)
+        x_dummy = jax.device_put(jax.random.uniform(f_key, minval=0.99-(5e-2), maxval=0.99, shape=(guess_batch, n_vars)), batch_sharding)
+        fixed_vars = jax.device_put(jnp.full((guess_batch, 1), fill_value=False, dtype=bool), batch_sharding)
         w_dummy = [w - 0.00001 for w in weights]
-        peak_mem = solver.peak_memory_estimation((x_dummy, w_dummy))
-        mem_est_per_point = peak_mem // batch
+        peak_mem = solver.peak_memory_estimation((x_dummy, fixed_vars, w_dummy))
+        mem_est_per_point = peak_mem // guess_batch
+        print(f"re-guess?? $ shape: {x_dummy.shape}, peak-est: {peak_mem}, peak/point: {mem_est_per_point}")
     else:
         mem_est_per_point = 1
 
-    # Adjust batch for max throughput, fairness, and to ensure we can allocate.
-    n_prefix = len(prefix_vectors) if prefix_vectors is not None else 1
+    # Adjust batch for max throughput, fairness, and to ensure we can allocate. (50% mem?)
     batch = adjust_batch(devices, batch, mem_est_per_point, n_prefix)
 
     if q_bench == 1:
-        return batch
+        print("returning best guess", batch//n_devices)
+        return batch//n_devices
         #pass
 
     if warmup:
-        if q_bench == 2 or dummy_batch != batch:
-            noise = jax.random.uniform(f_key, maxval=5e-2, shape=(batch, n_vars))
-            x_dummy = jax.device_put(jnp.full((batch, n_vars), fill_value=0.99, dtype=float) - noise, batch_sharding)
+        if q_bench == 2 or guess_batch != batch:
+            # noise = jax.random.uniform(f_key, maxval=5e-2, shape=(batch, n_vars))
+            # x_dummy = jax.device_put(jnp.full((batch, n_vars), fill_value=0.99, dtype=float) - noise, batch_sharding)
+            x_dummy = jax.device_put(jax.random.uniform(f_key, minval=0.99-(5e-2), maxval=0.99, shape=(batch, n_vars)), batch_sharding)
+            fixed_vars = jax.device_put(jnp.full((batch, 1), fill_value=False, dtype=bool), batch_sharding)
 
         if not benchmark:
             if mesh.shape['batch'] > 1:
@@ -289,12 +343,12 @@ def run_solver(
                 print("Objective sharding:")
                 jax.debug.visualize_array_sharding(objectives[0].clauses.lits)
 
-        peak_mem = solver.peak_memory_estimation((x_dummy, weights))
+        peak_mem = solver.peak_memory_estimation((x_dummy, fixed_vars, weights))
         mem_est_per_point = peak_mem // batch
-        print(mem_est_per_point)
-        return()
+        print(f"warmup: shape - {x_dummy.shape[0]}, peak-est - {peak_mem}, peak/point - {mem_est_per_point}")
+        # return()
         warm_start = time()
-        solver.warmup((x_dummy, weights), counting)
+        solver.warmup((x_dummy, fixed_vars, weights), counting)
         warm_end = time()
         if not counting and solver.warmup_sol:
             # Found a solution during warmup which we have printed. Exit now.
@@ -308,33 +362,66 @@ def run_solver(
     best_unsat = jnp.inf
     best_unsat_clauses_idx = None
     first_sol = None
-    starts = 0
+    batches_done = 0
     restart_ct = 0
+    restart_iters = []
+    restart_unsats = []
     timeout_m, timeout_s = divmod(timeout, 60)
+
+    histbars = []
+    infobars = []
+    if not benchmark:
+        iters_histo = sparklines({x: 0 for x in range(1, max(101,solver.maxiter+1))}.values(), num_lines=5)
+        # print(len(iters_histo))
+        #histbars = [tqdm(desc=histo[x], position=x, bar_format='{desc}', leave=False) for x in range(len(iters_histo))]
+        histbars = [tqdm(desc=" ", position=x, bar_format='{desc}', leave=True) for x in range(len(iters_histo))]
+        infobars = [tqdm(desc=" ", position=x+len(iters_histo), bar_format='{desc}', leave=True) for x in range(2)]
+        # infobars.append(tqdm(desc="0"+" "*(solver.maxiter-len(str(solver.maxiter)))+f"{solver.maxiter}", position=len(histbars), bar_format='{desc}', leave=True))
+        # infobars.append(tqdm(desc=f"Optim Iters: min: {0:{len(str(solver.maxiter))}.2f}, max: {0:{len(str(solver.maxiter))}.2f}, mean: {0:{len(str(solver.maxiter))}.2f}", position=len(histbars)+len(infobars), bar_format='{desc}', leave=True))
+        # print(histo)
+    pbstr = f"{batches_done % restart_thresh}/{restart_thresh}" if restart_thresh else f"{batches_done} batches"
+
     pbar = tqdm(
             total=timeout,
-            desc=f"restart {restart_ct} ({starts}/{restart} -- best={best_unsat})",
-            bar_format="{l_bar}{bar}| {elapsed}/" + str(timeout_m).zfill(2) + ":" + str(timeout_s).zfill(2),
+            leave=True,
+            position=len(infobars) + len(histbars),
+            desc=f"{"\n"*5}restart {restart_ct} ({pbstr} -- best={best_unsat})",
+            bar_format="{l_bar}{bar}| {elapsed}/" + str(timeout_m).zfill(2) + ":" + str(timeout_s).zfill(2) + "{postfix}",
+            postfix = f"{0:.2f}s/it"
             ) if not benchmark else None
-    t0 = time()
-    batch_time = t0
     accum_descent = 0
 
+    t0 = time()
     while (time() - t0 < timeout) and (not solver.warmup_sol or counting):
+        start_batch = time()
+        # if batches_done == 3:
+        #     print_array_stats()
         tloop = time()
 
         # Randomisation & Init
         key, s_key = jax.random.split(key)
         f_key, s_f_key = jax.random.split(f_key)
-        x0 = x0_guesses(s_key, batch, n_vars, sample_method, prefix_vectors)
+        x0, fixed_vars = x0_guesses(s_key, batch, n_vars, sample_method, prefix_vectors)
+        # x0 = jnp.zeros((batch, n_vars))
+        # if batches_done == 0:
+        #     print(x0.shape, x0[0, :])
+        # if batches_done == 0 and prefix_vectors is not None:
+        #     print("First prefix vector, and true vars in the first point in batch:", \
+        #           set((jnp.argwhere(prefix_vectors[0, :] == -1)+1).flatten().tolist()),\
+        #           set((jnp.argwhere(x0[0, :39] == -1)+1).flatten().tolist()))
         x0 = jax.device_put(x0, batch_sharding)
+        fixed_vars = jax.device_put(fixed_vars, batch_sharding)
 
         # Do it.
-        opt_x0, opt_unsat, opt_iters, opt_unsat_ct, eval_scores = solver.run(x0, weights)
+        opt_x0, opt_unsat, opt_iters, opt_unsat_ct, (_,eval_scores) = solver.run(x0, fixed_vars, weights)
 
+        # for x in range(10):
+        #     col3_true = set((jnp.argwhere(opt_x0[x, :39] == -1)+1).flatten().tolist())
+        #     extra_true = col3_true - set((jnp.argwhere(prefix_vectors[0,    :] == -1)+1).flatten().tolist())
+        #     if extra_true:
+        #         print("Anomaly!", col3_true, "extra positives:", extra_true)#.reshape(-1, 13))#, opt_x0[:2, 40:45])
         accum_descent += time() - tloop
         tbatch = time()
-
         batch_unsat_scores = jnp.sum(opt_unsat, axis=1)
         batch_best_unsat = jnp.min(batch_unsat_scores)
         batch_best_loc = jnp.argmin(batch_unsat_scores)
@@ -350,7 +437,7 @@ def run_solver(
         if batch_best_unsat == 0:
             if not counting and not benchmark:
                 print("Found a solution!")
-            if first_sol is None:
+            if first_sol is None and benchmark:
                 print("X-TTFS", tbatch-t0)
                 first_sol = np.asarray(jnp.sign(batch_best_x)).copy()
             found_sol = True
@@ -377,14 +464,14 @@ def run_solver(
                 # Project back on to hypercube.
                 F_x = jnp.clip(F_x + fuzz_adj, -1, 1)
 
-                F_opt_x, F_opt_unsat, F_opt_iters, F_opt_unsat_ct, F_eval_scores = solver.run(F_x, weights)
+                F_opt_x, F_opt_unsat, F_opt_iters, F_opt_unsat_ct, (_, F_eval_scores) = solver.run(F_x, fixed_vars, weights)
 
                 F_batch_unsat_scores = jnp.sum(opt_unsat, axis=1)
                 F_batch_best_unsat = jnp.min(F_batch_unsat_scores)
                 F_batch_best_loc = jnp.argmin(F_batch_unsat_scores)
                 F_batch_best_x = opt_x0[F_batch_best_loc]
                 F_batch_best_unsat_clauses_idx = jnp.nonzero(opt_unsat[F_batch_best_loc])
-                if F_batch_best < best_unsat:
+                if F_batch_best_unsat < best_unsat:
                     #TODO: We make a (spurious?) assumption that bumping a solution will find that solution again
                     # So this check needs to be adjusted to also check the number the solutions and replace only if
                     # find more - this covers both the counting and not counting case.
@@ -395,18 +482,18 @@ def run_solver(
                     best_unsat_clauses_idx = np.asarray(F_batch_best_unsat_clauses_idx).copy()
                     opt_x0, opt_unsat, opt_iters, opt_unsat_ct = F_x, F_opt_unsat, F_opt_iters, F_opt_unsat_ct
 
-                if batch_bestF == 0:
+                if F_batch_best_unsat == 0:
                     print(f"Fuzz {fuzz_attempt} found a solution!")
                     found_sol = True
                     break
 
-                if (jnp.sign(xFC) == jnp.sign(opt_xF)).all():
+                if (jnp.sign(F_x) == jnp.sign(F_opt_x)).all():
                     # If no points ended up changing signs after convergence, we didn't move at all. Increase magnitude
                     fuzz_mag += 1
                 else:
                     fuzz_mag = 1
 
-                xF = opt_xF
+                F_x = F_opt_x
 
         if found_sol:
             if counting == 2:
@@ -423,63 +510,111 @@ def run_solver(
                 # for sol in sol_locs:
                 #     all_sols.append(jnp.sign(opt_x0[sol]))
             if not counting:
-                print("not counting??")
+                #print("not counting??", eval_scores)
+                for x in range(len(histbars)):
+                    histbars[x].close()
+                for x in range(len(infobars)):
+                    infobars[x].close()
+                pbar.close()
+                (f"Optim Iters: min: {jnp.min(opt_iters)}, max: {jnp.max(opt_iters)}, mean: {jnp.mean(opt_iters)}")
+                #print("SAT! at index {} with starting point {} (ending {})".format(loc, best_start, best_x))
+                print("SAT! at index {}".format(max(batches_done, 0) * batch + batch_best_loc))
+                stamp = time()
+                print(f"More stats for sol:\nstart:\n{batch_best_loc}\niters:\n{opt_iters[batch_best_loc]} eval:{eval_scores[batch_best_loc]}\nunsat:\n{opt_unsat[batch_best_loc]}\nended:\n{opt_x0[batch_best_loc]}")
                 break
         # clauses = {}
-        # best_start = x_starts[loc]
+        # best_start = x_batches_done[loc]
 
         # if found_sol:
         #     print(f"Optim Iters: min: {jnp.min(opt_iters)}, max: {jnp.max(opt_iters)}, mean: {jnp.mean(opt_iters)}")
         #     #print("SAT! at index {} with starting point {} (ending {})".format(loc, best_start, best_x))
-        #     print("SAT! at index {}".format(max((starts - 1), 0) * batch + loc))
+        #     print("SAT! at index {}".format(max((batches_done - 1), 0) * batch + loc))
         #     stamp = time()
         #     print(f"More stats for sol:\nstart:\n{loc}\niters:\n{opt_iters[loc]} eval:{eval_scores[loc]}\nunsat:\n{opt_unsat[loc]}\nended:\n{opt_x0[loc]}")
         #     break
 
-        #print(f"Optim Iters: min: {jnp.min(opt_iters)}, max: {jnp.max(opt_iters)}, mean: {jnp.mean(opt_iters)}")
-        starts += 1
-        if restart and starts >= restart:
-            iters = jnp.concat(all_dcnt_iters)
-            unsat_ct = jnp.array(all_unsat_cts)
+        opt_iters_local = np.array(opt_iters.flatten()).tolist()
+        if not benchmark:
+            opt_iters_counts = Counter(opt_iters_local)
+            if solver.maxiter > 100:
+                bin_width = solver.maxiter / 100
+            else:
+                bin_width = 1
+            iters_histo = [0]*100
+            for k, v in opt_iters_counts.items():
+                bin_idx = int(k / bin_width)
+                if bin_idx == 100:
+                    bin_idx = 99
+                iters_histo[bin_idx] += v
+            # iters_histo = {x : opt_iters_counts[x] if x in opt_iters_counts else 0 for x in range(1, solver.maxiter+1)}
+            iters_histo_tq = sparklines(iters_histo, num_lines=5)
+            if solver.maxiter > 96:
+                infobars[0].set_description_str("0"+" "*(100-len(str(solver.maxiter)))+f"{solver.maxiter}")
+            else:
+                infobars[0].set_description_str("0"+" "*(solver.maxiter-len(str(solver.maxiter)))+f"{solver.maxiter}"+
+                                                " "*(97-solver.maxiter)+"100")
+            for x in range(len(histbars)):
+                histbars[x].set_description_str(iters_histo_tq[x])
 
-            # Reset/update for next restart
-            restart_ct += 1
-            seed = int(time()) if benchmark else restart_ct
-            key = jax.random.PRNGKey(np.array(seed))
-            f_key = jax.random.PRNGKey(np.array(seed + 1))
-            starts = 0
-            penalty = unsat_ct.sum(axis=0)
-            worst = penalty.max()
+            infobars[-1].set_description_str(f"Optim Iters: min: {jnp.min(opt_iters)}, max: {jnp.max(opt_iters)} ({iters_histo[solver.maxiter-1]}), median: {jnp.median(opt_iters)}")
 
-            print(f"Optim Iters: min: {jnp.min(iters)}, max: {jnp.max(iters)}, mean: {jnp.mean(iters)}")
-            print(f"Restarts: {restart_ct} | Current  (#unsat): {best_unsat}")
-            print(f"Unsat counts: {penalty}, \nBest: {best_unsat_clause_idx}")
+        #print(f"List: {iter_sorted}")
+        batches_done += 1
+        if restart_thresh:
+            if batches_done % restart_thresh:
+                unsat_ct = jnp.array(restart_unsats)
 
-            pen_start = 0
-            # adjust to always target -k?
-            for idx, weight in enumerate(weights):
-                n_clause = len(weight)
-                pen_end = pen_start + n_clause
-                w_pens = penalty[pen_start:pen_end]
-                weight = jnp.where(w_pens > 0, weight + 0.1 * w_pens / worst, 1)
-                #weights[idx] = jax.device_put(adj_weight, objective_sharding)
-                pen_start += n_clause
+                # Reset/update for next restart
+                restart_ct += 1
+                seed = int(time()) if benchmark else restart_ct
+                key = jax.random.PRNGKey(np.array(seed))
+                f_key = jax.random.PRNGKey(np.array(seed + 1))
+                penalty = unsat_ct.sum(axis=0)
+                worst = penalty.max()
 
+                # print(f"Optim Iters: min: {jnp.min(restart_iters)}, max: {jnp.max(restart_iters)}, mean: {jnp.mean(restart_iters)}")
+                print(f"# Restart: {restart_ct} | Current  (#unsat): {best_unsat}")
+                print(f"Unsat counts: {penalty}, \nBest: {best_unsat_clauses_idx}")
+
+                pen_start = 0
+                # adjust to always target -k?
+                for idx, weight in enumerate(weights):
+                    n_clause = len(weight)
+                    pen_end = pen_start + n_clause
+                    w_pens = penalty[pen_start:pen_end]
+                    weight = jnp.where(w_pens > 0, weight + 0.1 * w_pens / worst, 1)
+                    #weights[idx] = jax.device_put(adj_weight, objective_sharding)
+                    pen_start += n_clause
+            else:
+                restart_unsats.append()
+                restart_iters.extend(opt_iters_local)
+
+        end_batch = time()
         if pbar:
-            pbar.set_description(f"restart {restart_ct} ({starts}/{restart} -- best={best_unsat})")
-            pbar.update(time() - batch_time)
-        batch_time = time()
+            pbstr = f"{batches_done % restart_thresh}/{restart_thresh}" if restart_thresh else f"{batches_done} batches"
+            pbel = pbar.format_dict['elapsed']
+            pbn = pbar.format_dict['n']
+            batch_elapsed = end_batch - start_batch
+            pbar.set_description(f"restart {restart_ct} ({pbstr} -- best={best_unsat})")
+            if pbn + batch_elapsed > timeout:
+                pbar.update(timeout - pbel)
+            else:
+                pbar.update(end_batch - start_batch) #update *adds* the input to the counter.
+            pbel = pbar.format_dict['elapsed']
+            pbar.set_postfix_str(f"({(pbel/batches_done):.2f}s/it)")
         #del x0
         #jax.clear_caches()
         # print("end loop", time() - tloop)
     tsolve = time() - t0
 
     if pbar:
+        for x in range(len(histbars)):
+            histbars[x].close()
+        for x in range(len(infobars)):
+            infobars[x].close()
         pbar.close()
 
     p_sol = 0
-    a = time()
-
     all_sols = [first_sol] if all_sols is None and first_sol is not None else all_sols
     if all_sols is not None:
         for sol in all_sols:
@@ -497,27 +632,56 @@ def run_solver(
             p_sol += 1
             if benchmark:# and p_sol > 3:
                 break
-
-    print("START EXP")
-    print("X-GPU", n_devices)
-    print("X-PPBATCH", batch)
-    print("X-PPGPUBATCH", batch//n_devices, "PPBATCH/GPU")
-    if warmup:
-        print("X-PEAK", peak_mem)
-        print("X-PEAKPP", mem_est_per_point, "PEAK/PPBATCH")
-    print("X-BATCHES", starts)
-    print("X-PTOTAL", starts*batch, "BATCHES*PPBATCH")
-    print("X-LOOP", tsolve)
-    print("X-DESC", accum_descent)
-    if all_sols is not None and first_sol is not None:
-        print("X-SOLS", all_sols_cnt)
-        print("X-UQSOLS", len(all_sols))
     else:
-        print("X-SOLS", 0)
-        print("X-UQSOLS", 0)
-    print("X-RATIODESC", (starts*batch)/accum_descent, "POINTS/DESCTIME")
-    print("X-RATIOLOOP", (starts*batch)/tsolve, "POINTS/LOOPTIME")
-    print("END EXP")
+        print("Best assignment found:")
+        out_string = "v"
+        assignment = []
+        for i in range(n_vars):
+            lit = i + 1
+            if best_x[i] > 0:
+                out_string += f" {-lit}"
+                assignment.append(-lit)
+            else:
+                out_string += f" {lit}"
+                assignment.append(lit)
+        print(out_string)
+        assignment = set(assignment)
+        for i, cl_idx in enumerate(best_unsat_clauses_idx.flatten()):
+            find_idx = cl_idx
+            for obj in objectives:
+                obj_len = obj.clauses.lits.shape[0]
+                if find_idx < obj_len:
+                    if len(obj.clauses.sign.shape) > 1:
+                        clause = set(((obj.clauses.lits[find_idx]+1)*obj.clauses.sign[find_idx]).tolist())
+                    else:
+                        clause = set(((obj.clauses.lits[find_idx]+1)*obj.clauses.sign).tolist())
+                    print(clause.intersection(assignment), clause)
+                    break
+                else:
+                    find_idx -= obj_len
+            # print(best_unsat_clauses_idx)
+
+    if benchmark or counting:
+        print("START EXP")
+        print("X-GPU", n_devices)
+        print("X-PPBATCH", batch)
+        print("X-PPGPUBATCH", batch//n_devices, "PPBATCH/GPU")
+        if warmup:
+            print("X-PEAK", peak_mem)
+            print("X-PEAKPP", mem_est_per_point, "PEAK/PPBATCH")
+        print("X-BATCHES", batches_done)
+        print("X-PTOTAL", batches_done*batch, "BATCHES*PPBATCH")
+        print("X-LOOP", tsolve)
+        print("X-DESC", accum_descent)
+        if all_sols is not None and first_sol is not None:
+            print("X-SOLS", all_sols_cnt)
+            print("X-UQSOLS", len(all_sols))
+        else:
+            print("X-SOLS", 0)
+            print("X-UQSOLS", 0)
+        print("X-RATIODESC", (batches_done*batch)/accum_descent, "POINTS/DESCTIME")
+        print("X-RATIOLOOP", (batches_done*batch)/tsolve, "POINTS/LOOPTIME")
+        print("END EXP")
     return tsolve
 
 
@@ -525,7 +689,7 @@ def main(
     file: str,
     timeout: int,
     batch: int | None,
-    restart: int,
+    restart_thresh: int,
     fuzz: int,
     n_devices: int,
     disk_cache: str = None,
@@ -533,6 +697,7 @@ def main(
     counting: int = 0,
     warmup: bool = False,
     rand_seed: bool = False,
+    prefixes: str = None,
     q_bench: bool = False
 ) -> None:
     if file is None:
@@ -551,32 +716,27 @@ def main(
     stamp1 = time()
     process_time = stamp1 - stamp2
 
+    if prefixes:
+        prefixes = sat_parser.process_prefix(prefixes)
+
     if q_bench:
-        opt_batch = run_solver(timeout, n_var, n_clause, batch, restart, fuzz, objectives, \
-                         n_devices=n_devices, counting=counting, benchmark=benchmark, warmup=warmup, q_bench=1)
-        fractions_neighbourhood = [0.55, 0.66, 0.75, 0.85, 0.95]
-        small = [x for x in [int(opt_batch*(1/(2**i))) for i in range(20,0,-1)] if x > 63 and x < 0.55*opt_batch]
-        batch_spectrum = small + [int(opt_batch*frac) for frac in fractions_neighbourhood] + [opt_batch] \
-        + [int(opt_batch/frac) for frac in fractions_neighbourhood[::-1]]
+        opt_batch = run_solver(timeout, n_var, n_clause, batch, restart_thresh, fuzz, objectives, \
+                         n_devices=n_devices, counting=counting, rand_seed=rand_seed, benchmark=benchmark, warmup=warmup, q_bench=1)
+        fracs = [0.15, 0.5, 0.8, 1, 1.2, 1.5, 1.85]
+        batch_spectrum = [int(opt_batch*frac) for frac in fracs]
+        small = [x for x in [int(opt_batch*(1/(2**i))) for i in range(24,0,-1)] if x > 8 and x < batch_spectrum[0]]
+        batch_spectrum = small + batch_spectrum
         print(batch_spectrum)
-            # Memory estimate for batch tuning, then warmup precompilation.
-    #for test_batch in [2**7, 2**8]+[2**8+j for j in range(50, (2**11-2**8)+1, 50)]+[2**i for i in range(12,22)]:
-    # for test_batch in [2**i for i in (list(range(8,12))+list(range(18,20)))[::-1]]:
-    
-    #     #print("Batch Memory Consumption estimate with size:", test_batch)
         print(f"MEMORY THROUGHPUT PROFILING (OPT = {opt_batch})")
-        for test_batch in list(range(645,646,1)):# + list(range(1747,1748,1)):#[244, 488, 978, 1956, 3912, 7826]:#batch_spectrum[:6]:#[::-1]:
-            jax.clear_caches()
-            low = 645
-            high = 1747
+        for test_batch in batch_spectrum[::-1]:
             for r in range(1):
-                tsolve = run_solver(20, n_var, n_clause, (test_batch+4)*16, restart, fuzz, objectives, \
-                         n_devices=n_devices, counting=counting, benchmark=True, warmup=not r, q_bench=2)
+                tsolve = run_solver(60, n_var, n_clause, test_batch, restart_thresh, fuzz, objectives, \
+                         n_devices=n_devices, counting=counting, rand_seed=rand_seed, benchmark=True, warmup=not r, q_bench=2)
 
     else:
-        t_solve = run_solver(timeout, n_var, n_clause, batch, restart, fuzz, objectives, \
-                         n_devices=n_devices, counting=counting, benchmark=benchmark, warmup=warmup, \
-                         prefix_vectors=None)  # TODO: Add command line arg for prefix_vectors
+        t_solve = run_solver(timeout, n_var, n_clause, batch, restart_thresh, fuzz, objectives, \
+                         n_devices=n_devices, counting=counting, rand_seed=rand_seed, benchmark=benchmark, warmup=warmup, \
+                         prefix_vectors=prefixes)  # TODO: Add command line arg for prefix_vectors
     # print("Some stats")
     # print("Time reading input:", read_time)
     # print("Time processing to Arrays:", process_time)
@@ -584,7 +744,7 @@ def main(
 
 
 if __name__ == "__main__":
-    n_devices = len(jax.devices("gpu"))
+
     ap = ArgParse(
         description="Process a file with optional parameters",
         epilog="Some debug options:"
@@ -598,14 +758,14 @@ if __name__ == "__main__":
     ap.add_argument("-t", "--timeout", type=int, default=300, help="Maximum runtime (timeout seconds)")
     ap.add_argument("-b", "--batch", type=int, default=-1, help="Batch size. -1 computes heuristic maximum")
     ap.add_argument("-f", "--fuzz", type=int, default=0, help="Number of times to attempt fuzzing per batch")
-    ap.add_argument("-r", "--restart", type=int, default=0, help="Batches before reweight and restart (never if 0)")
-    ap.add_argument("-n", "--n_devices", type=int, default=n_devices, help="Devices (eg. GPUs) to use. 0 uses all")
+    ap.add_argument("-r", "--restart_thresh", type=int, default=0, help="Batches before reweighting (never if 0)")
+    ap.add_argument("-n", "--n_devices", type=int, default=0, help="Devices (eg. GPUs) to use. 0 uses all")
     ap.add_argument("-e", "--benchmark", action="store_true", help="Benchmark mode (reduce output)")
     ap.add_argument("-c", "--counting", type=int, default=0, help="Counting mode. Count solns until timeout")
     ap.add_argument("-w", "--warmup", action="store_true", help="Perform a warmup run before starting timer.")
     ap.add_argument("-d", "--debug", choices=LOG_LEVELS, default="ERROR", help=f"Set logging level ({LOG_LEVELS})")
-    ap.add_argument("-s", "--rand_seed", action="store_true", help=f"Randomise seed")
-    ap.add_argument("-q", "--q_bench", action="store_true", help=f"Memory Bench")
+    ap.add_argument("-s", "--rand_seed", action="store_true", help="Randomise seed")
+    ap.add_argument("-y", "--prefix", type=str, default=None, help="A collection of fixed assignments in solution format")
 
     arg = ap.parse_args()
     print("Warmup:", arg.warmup, "|| Benchmark:", arg.benchmark, \
@@ -614,7 +774,7 @@ if __name__ == "__main__":
         jax.clear_caches()
 
     if not arg.n_devices:
-        arg.n_devices = len(jax.devices())
+        arg.n_devices = len(jax.devices(jax.default_backend()))
 
     logging.basicConfig(
         level=getattr(logging, arg.debug.upper()),
@@ -627,8 +787,7 @@ if __name__ == "__main__":
     # Run with or without profiler based on the flag
     profiler = jax.profiler.trace("/tmp/jax-trace", create_perfetto_link=False) if arg.profile else nullcontext()
     with profiler:
-        main(arg.file, arg.timeout, arg.batch, arg.restart, arg.fuzz, arg.n_devices, \
-            benchmark=arg.benchmark, counting=arg.counting, warmup=arg.warmup, rand_seed=arg.rand_seed,
-            q_bench=arg.q_bench)
+        main(arg.file, arg.timeout, arg.batch, arg.restart_thresh, arg.fuzz, arg.n_devices, \
+            benchmark=arg.benchmark, counting=arg.counting, warmup=arg.warmup, rand_seed=arg.rand_seed, prefixes=arg.prefix)
         if arg.profile:
             jax.profiler.save_device_memory_profile("memory.prof")

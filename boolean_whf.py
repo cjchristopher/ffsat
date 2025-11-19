@@ -5,7 +5,6 @@ from fractions import Fraction
 from itertools import accumulate
 from math import comb
 from typing import NamedTuple
-from typing import Optional as Opt
 
 import jax.numpy as jnp
 import numpy as np
@@ -57,20 +56,20 @@ class ClauseProcessor:
         if disk_cache and isinstance(disk_cache, FFSATCache):
             self.disk_cache: dict = disk_cache
 
-    def _wf_coeffs(self, sig: ClauseSignature) -> Array:
+    def _wf_coeffs(self, sig: ClauseSignature) -> NDArray:
         """Calculate Walsh-Fourier coefficients for a given clause type.
         Returns the c_len+1 coefficients as per:
         [Constant, Degree 1 ESP, Degree 2 ESP, ..., Degree C_LEN ESP]
         """
 
-        def __int_noisepoly_numerators(n: int, k: int, neg_k: int) -> list[int]:
+        def __int_noisepoly_coeffs(n: int, k: int, flip_neg_k: int) -> list[int]:
             """Numpy's poly.poly.polyfromroots uses convolutions and changes to float to account for polynomial
             construction from generic roots. For even moderate n (e.g. 120), this causes numerical errors.
             Here our polynomial is monic, and only has roots in {-1, 1}, and so we can use the binomial theorem
             and symmetry explotiation to be faster, and more accurate.
 
-            Compute the coefficients of a polynomial roots -1 ($$ n-k $$ mutiplicity) and 1 ($$ k-1 $$ multiplicity).
-            Factor in the $$(-1)^{k-1}$$ and the combinatoric constant multiplier to get the final numerators.
+            Compute the coefficients of a polynomial roots -1 ($ n-k $ mutiplicity) and 1 ($ k-1 $ multiplicity).
+            Factor in the $(-1)^{k-1}$ and the combinatoric constant multiplier to get the final coefficients.
             """
             if k < 1 or k > n:
                 raise ValueError("k must satisfy 1 ≤ k ≤ n")
@@ -92,7 +91,7 @@ class ClauseProcessor:
                 if mirror_idx != i:
                     coeffs[mirror_idx] = sign * coeffs[i]
 
-            negate = neg_k * ((-1) ** ((k - 1) % 2))
+            negate = flip_neg_k * ((-1) ** ((k - 1) % 2))
             const = comb(n - 1, k - 1)
             coeffs = [const * (negate * coeff) for coeff in coeffs]
             assert all([abs(c1) == abs(c2) for c1, c2 in zip(coeffs, coeffs[::-1])])
@@ -100,13 +99,11 @@ class ClauseProcessor:
 
         def __cnf(n: int) -> NDArray:
             r"""Walsh-Fourier coefficients for CNF (OR) clauses.
-            $$
-            \widehat{\texttt{OR}}(S) = \left\lbrace
-            \begin{aligned}
-                &\frac{1}{2^{n-1}} - 1 & \abs{S} = 0 \\
-                &\frac{1}{2^{n-1}} & \abs{S} \neq 0
-            \end{aligned}\right.
-            $$
+            $$\widehat{\texttt{OR}}(S) =
+            \begin{dcases}
+                \frac{1}{2^{n-1}} - 1 & \abs{S} = 0 \\
+                \frac{1}{2^{n-1}} & \abs{S} \neq 0
+            \end{dcases}$$
             """
             d = np.full(n + 1, 1 / (2 ** (n - 1)))
             d[0] -= 1
@@ -114,23 +111,59 @@ class ClauseProcessor:
 
         def __eo(n: int) -> NDArray:
             r"""Walsh-Fourier coefficients for exactly-one (EO) clauses.
-            $$
-            \widehat{\texttt{EO}}(S) = \left\lbrace
-            \begin{aligned}
-                &1-\frac{n}{2^{n-1}} & \abs{S} = 0 \\
-                &\frac{2\abs{S}-n}{2^{n-1}} & \abs{S} \neq 0
-            \end{aligned}\right.
-            $$
+            $$\widehat{\texttt{EO}}(S) =
+            \begin{cases}
+                1-\frac{n}{2^{n-1}} & \abs{S} = 0 \\
+                \frac{2\abs{S}-n}{2^{n-1}} & \abs{S} \neq 0
+            \end{cases}$$
             """
             d = np.arange(-n, n + 1, 2, dtype=float) / (2 ** (n - 1))  # EO(S) = (2|S|-n)/2^(n-1)
             d[0] = 1 - n / (2 ** (n - 1))
             return d
 
+        def __ek(n: int, k: int) -> NDArray:
+            r"""Walsh-Fourier coefficients for exactly-k ($E_k$) clauses.
+            $$\begin{align*}
+                \widehat{{\texttt{E}_{k}}}(S) &=
+                    \begin{dcases}
+                        1-\frac{\binom{n}{k}}{2^{n-1}} & \abs{S} = 0 \\
+                        \frac{\binom{n-1}{k-1}\left(g_{\texttt{EK}}(\rho)\right)_{[p^{|S|-1}]}}
+                             {{n-1\choose |S|-1}2^{n-1}} & \abs{S} \neq 0
+                    \end{dcases}\\
+                g_{\texttt{EK}}(\rho) &= \binom{n-1}{k-1}\frac{((2k-n) + n\rho)}{k}(1+\rho)^{n-k-1}(1-p)^{k-1}\\
+                &=\frac{1}{n}\binom{n}{k}((2k-n) + n\rho)(1+\rho)^{n-k-1}(1-p)^{k-1}
+            \end{align*}$$
+            No additional simplication here, beyond the special cases of $k=1$ or $k=n$, which are $\texttt{EO}$ and all True,
+            respectively. For the former use the dedicated routine, for the latter it should be caught prior to this.
+            For more info see the documenation for __card()
+            """
+
+            #TODO: Fix docstring - still the CARD formula.
+            #TODO: Fix implementation.
+
+            """
+            Compute coefficients of $\rho^{i}$ in $g(\rho) = \frac{1}{n}\binom{n}{k}((2k-n) + np)(1+\rho)^{n-k-1}(1-p)^{k-1}$
+            """
+            d = np.zeros(n + 1, dtype=float)
+
+            coeff_numers = __int_noisepoly_coeffs(n, k, 1)
+            A = n - k - 1
+            B = k - 1
+            coeff = comb(n, k, exact=True) / n
+
+            # multiply by ((2k - n) + n*p)
+            g[0:len(S)] += (2 * k - n) * S
+            g[1:len(S) + 1] += n * S
+
+            d = np.array([1-(comb(n, k)/(2 ** (n - 1)))] + coeff * g)
+            return d
+
+
         def __nae(n: int) -> NDArray:
             r"""Walsh-Fourier coefficients for not-all-equal (NAE) clauses.
-            For all even $$|S|$$, the coefficient at that size is $$(1/2)^{n-2}$$ due to cancellation of all even terms in $$g(\rho)$$,
-            and exactly $${n-1\choose |S|-1}$$ at all odd terms. This cancels the denominator in the general equation,
-            leaving a factor of 2. This happens to essentially align with the $$|S|=0$$ case, but subtract 1. Hence:
+            For all even $|S|$, the coefficient at that size is $(1/2)^{n-2}$ due to cancellation of all even terms in $g(\rho)$,
+            and exactly ${n-1\choose |S|-1}$ at all odd terms. This cancels the denominator in the general equation,
+            leaving a factor of 2. This happens to essentially align with the $|S|=0$ case, but subtract 1. Hence:
             """
             d = np.zeros(n + 1, dtype=float)
             d[::2] = 1 / (2 ** (n - 2))
@@ -148,11 +181,11 @@ class ClauseProcessor:
         def __amo(n: int) -> NDArray:
             r"""Walsh-Fourier coefficients for at-most-one (AMO) clauses.
             $$
-            \widehat{\texttt{AMO}}(S) = \left\lbrace
-            \begin{aligned}
-                &1-\frac{n-1}{2^{n-1}} & \abs{S} = 0 \\
-                &\frac{2\abs{S}-n-1}{2^{n-1}} & \abs{S} \neq 0
-            \end{aligned}\right.
+            \widehat{\texttt{AMO}}(S) =
+            \begin{dcases}
+                1-\frac{n-1}{2^{n-1}} & \abs{S} = 0 \\
+                \frac{2\abs{S}-n-1}{2^{n-1}} & \abs{S} \neq 0
+            \end{dcases}
             $$
             """
 
@@ -162,46 +195,53 @@ class ClauseProcessor:
 
         def __card(n: int, k: int) -> NDArray:
             r"""Walsh-Fourier coefficients for cardinality clauses.
-            This does not simplify to a clean closed form, so we require some manual computation.
-            The dominating step is polyfromroots, at $$O(n\cdot log^{2}(n))$$ for a clause of $$n$$ variables.
-            $$
-            \widehat{{\texttt{CARD}_{\geq k}}}(S) = \left\lbrace
-            \begin{aligned}
-                &1-\frac{\sum_{i=k}^{n}{n\choose i}}{2^{n-1}} & \abs{S} = 0 \\
-                &\frac{{n-1 \choose k-1}\left(g_{\texttt{CARD}}(\rho)\right)_{[p^{|S|-1}]}}{{n-1\choose |S|-1}2^{n-1}} & \abs{S} \neq 0
-            \end{aligned}\right.
-            $$
-            and $$ g_{\texttt{CARD}}(\rho) = (1+\rho)^{n-k}(1-\rho)^{k-1} $$
+            $$\begin{align*}
+                \widehat{{\texttt{CARD}_{\geq k}}}(S) &=
+                \begin{dcases}
+                    1-\frac{\sum_{i=k}^{n}{n\choose i}}{2^{n-1}} & \abs{S} = 0 \\
+                    \frac{{n-1 \choose k-1}\left(g_{\texttt{CARD}}(\rho)\right)_{[p^{|S|-1}]}}{{n-1\choose |S|-1}2^{n-1}} & \abs{S} \neq 0
+                \end{dcases}\\
+                g_{\texttt{CARD}}(\rho) &= (1+\rho)^{n-k}(1-\rho)^{k-1}
+            \end{align*}$$
+            This does not simplify to as clean a closed form, so we require some manual computation.
+            The dominating step for small $n$ would be np.polyfromroots, at $O(n\cdot log^{2}(n))$ for a clause of $n$ variables.
+            However, to maintain numerical stability for larger $n$, we use a bespoke implementation in $O(n^2)$ for all $n$.
 
-            For $$n=k$$, e.g. clause $$c = \texttt{CARD}^{\geq n}(x_1, x_2,\ldots, x_n)$$ is just $$c = x_1 \land x_2 \land \ldots \land x_n$$.
-            Then $$g_{\texttt{CARD}} = (1-\rho)^{n-1}$$. The coefficients are just the  $$(n-1)$$th row of Pascal's triangle, 
-            with every second term negated, or... $$(-1)^{|S|-1}{n-1 \choose |S|-1}$$, cancelling out.
-            This means we get a simplified form:
-            $$
-            \widehat{{\texttt{CARD}_{*}}}(S) = \left\lbrace
-            \begin{aligned}
-                &1-\frac{1}{2^{n-1}} & \abs{S} = 0 \\
-                &\frac{(-1)^{|S|-1}}{2^{n-1}} & \abs{S} \neq 0
-            \end{aligned}\right.
-            $$
-            Having said this... there is merit to force reincoding this as n separate unit literals.
-            Notably those individual terms will be trivially minimisable. This form is distinctly not.
-            Also we need to still compute the full transformation in $$n$$ variables if we use this form.
-            For $$k=0$$ the clause is trivial and should be dropped instead of evaluated as well - e.g
-            clause $$c = \texttt{CARD}^{\geq 0}(x_1, x_2,\ldots)$$ is just $$FE_c = -1$$ (always SAT).
-            These are now handled in the loader itself, but for posterity:
-            $$n = k \Rightarrow$$ d = np.full(n + 1, (2 ** -(n - 1)), dtype=float); d[::2] *= -1; d[0] += 1
-            $$k=0\Rightarrow$$ d = np.zeros(n + 1, dtype=float); d[0] = -1
+            Special Cases:
+            $k=n$:
+                e.g. clause $c = \texttt{CARD}_{\geq n}(x_1, x_2,\ldots, x_n)$ is just $c = x_1 \land x_2 \land \ldots \land x_n$.
+                Then $g_{\texttt{CARD}} = (1-\rho)^{n-1}$. The coefficients are just the  $(n-1)$th row of Pascal's triangle, 
+                with every second term negated, or... $(-1)^{|S|-1}{n-1 \choose |S|-1}$, cancelling out.
+                This means we get a simplified form:
+                $$\widehat{{\texttt{CARD}_{\geq n}}}(S) = \left\lbrace
+                \begin{aligned}
+                    &1-\frac{1}{2^{n-1}} & \abs{S} = 0 \\
+                    &\frac{(-1)^{|S|-1}}{2^{n-1}} & \abs{S} \neq 0
+                \end{aligned}\right.
+                $$
+                Having said this... there is more merit to force reincoding this as n separate unit literals
+                Notably those individual terms will be trivially minimisable. This form is distinctly not.
+                Also we need to still compute the full transformation in $n$ variables if we use this form.
+
+            $k=0$:
+                The clause is trivial and should be dropped instead of evaluated as well - e.g
+                clause $c = \texttt{CARD}^{\geq 0}(x_1, x_2,\ldots)$ is just $FE_c = -1$ (always SAT).
+
+            These should be detected and handled long before this function is called, but for posterity:
+                $n = k \Rightarrow$ d = np.full(n + 1, (2 ** -(n - 1)), dtype=float); d[::2] *= -1; d[0] += 1
+                $k=0\Rightarrow$ d = np.zeros(n + 1, dtype=float); d[0] = -1
             """
-            neg_k = k / (abs(k))
+            # Transform formulated for $\geq k$ constraints, so negate $\leq k$ constraints and then correct.
+            flip_neg_k = int(k / (abs(k)))
             k = abs(k)
-            # Calculate $$g(\rho) = (1+\rho)^{n-k}(1-\rho)^{k-1}$$, and reformulate for zeroes: $$(1-\rho) = -(\rho-1)$$
-            # Therefore $$g(\rho) = (\rho+1)^{n-k}(\rho-1)^{k-1}(-1)^{k-1}$$, and then multiply by combinatoric term $${n-1 \choose k-1}$$
-            # We do this ourselves from the $$\pm1$$ roots for numeric stability.
-            coeff_numers = __int_noisepoly_numerators(n, k, neg_k)
 
-            # The denominator for each $$|S|$$ has a $${n-1 \choose |S|-1}$$ term. Since each subsequent term in the series can be expressed
-            # as the product of the last term and the current term $$S_i$$: $$S_{i+1} = S_i\cdot(n-i)/(i+1)$$, we save time computing the
+            # Calculate $g(\rho) = (1+\rho)^{n-k}(1-\rho)^{k-1}$, and reformulate for zeroes: $(1-\rho) = -(\rho-1)$
+            # Therefore $g(\rho) = (\rho+1)^{n-k}(\rho-1)^{k-1}(-1)^{k-1}$, and then multiply by combinatoric term ${n-1 \choose k-1}$
+            # We do this ourselves from the $\pm1$ roots for numeric stability.
+            g_coeffs = __int_noisepoly_coeffs(n, k, flip_neg_k)
+
+            # The denominator for each $|S|$ has a ${n-1 \choose |S|-1}$ term. Since each subsequent term in the series can be expressed
+            # as the product of the last term and the current term $S_i$: $S_{i+1} = S_i\cdot(n-i)/(i+1)$, we save time computing the
             # m = (n-1)th row of Pascal's triangle (where the top is row 0) progressively (vectorised) vs calling comb()
             # The triangle is left-right symmetric, so m//2+1 is enough. Stay with native int as long as possible.
             m = n - 1
@@ -209,7 +249,7 @@ class ClauseProcessor:
 
             # Calculate the factorial numerator and denominators separately, and integer divide for stability.
             # This implements the above recurrence for each subsequent term up to the midpoint of the triangle.
-            # Then flip and concat - offset in case of unique middle element - and finally scale by $$2^{n-1}$$
+            # Then flip and concat - offset in case of unique middle element - and finally scale by $2^{n-1}$
             pascal_idx = list(range(1, ((m // 2) + 1)))
             pascal_denoms = list(accumulate(pascal_idx, ops.mul))  # cumprod (i*(i+1)*(i+2)...)
             pascal_numers = list(accumulate([n - p for p in pascal_idx], ops.mul))  # cumprod ((n-1)*(n-2)*...)
@@ -229,13 +269,13 @@ class ClauseProcessor:
             # assert all(np.abs(d[1:]) == np.abs(d[1:][::-1])) # Check symmetry
 
             # Compute the coefficients and check symmetry once more up to signs.
-            coeffs = [numer / denom for numer, denom in zip(coeff_numers, coeff_denoms)]
+            coeffs = [numer / denom for numer, denom in zip(g_coeffs, coeff_denoms)]
             assert all([abs(c1) == abs(c2) for c1, c2 in zip(coeffs, coeffs[::-1])])
 
             d = np.array([2 * binom.cdf(k - 1, n, 0.5) - 1] + coeffs)
             return d
 
-        method_map = {
+        method_map: dict[str, Callable[[int | tuple[int, int]], NDArray]] = {
             "cnf": __cnf,
             "eo": __eo,
             "nae": __nae,
@@ -254,7 +294,7 @@ class ClauseProcessor:
             raise ValueError("Cardinality clause without specified cardinality")
         return method_map[sig.type](sig.len)
 
-    def _pad(self, arrays: list[NDArray | list[int]], pad_val: Opt[int] = 0) -> tuple[NDArray, NDArray]:
+    def _pad(self, arrays: list[NDArray | list[int]], pad_val: int | None = 0) -> tuple[NDArray, NDArray]:
         arrays = [np.array(arr) if isinstance(arr, (list, int)) else arr for arr in arrays]
         rows = len(arrays)
         if rows > 1:
@@ -289,7 +329,7 @@ class ClauseProcessor:
             try:
                 assert np.all([arr.ndim == arrays[0].ndim for arr in arrays])
             except AssertionError as e:
-                raise e("All sub arrays must have same number of dimensions")
+                raise Exception("All sub arrays must have same number of dimensions")
             max_dims = np.max([arr.shape for arr in arrays], axis=0)
             padded_shape = (rows + extra_rows, *max_dims)
             padded = np.full(padded_shape, pad_val, dtype=dtype)
@@ -399,3 +439,82 @@ class ClauseProcessor:
         if not benchmark:
             print("Processed objective has", clauses.lits.shape[0], "clauses with signature(s):", signatures)
         return Objective(clauses=clauses, ffts=ffts, forward_mask=forward_mask)
+
+
+## AI STUFF
+
+# # ...existing code...
+# def _binomial_row(a: int, upto: int) -> list[int]:
+#     # compute C(a,0..upto) using recurrence (safe integer arithmetic)
+#     row = [1] * (upto + 1)
+#     val = 1
+#     for r in range(1, upto + 1):
+#         val = val * (a - (r - 1)) // r
+#         row[r] = val
+#     return row
+
+# def __int_noisepoly_numerators(n: int, k: int, neg_k: int) -> list[int]:
+#     # ...existing code...
+#     if k < 1 or k > n:
+#         raise ValueError("k must satisfy 1 ≤ k ≤ n")
+
+#     coeffs = [0] * n
+#     i_max = min(n - k, (n - 1) // 2)         # max i we may need
+#     j_max = min(k - 1, (n - 1) // 2)         # max j we may need
+
+#     row1 = _binomial_row(n - k, i_max)       # C(n-k, i)
+#     row2 = _binomial_row(k - 1, j_max)       # C(k-1, j)
+
+#     for i in range(i_max + 1):
+#         for j in range(j_max + 1):
+#             power = i + j
+#             if power > (n - 1) // 2:
+#                 break
+#             coeff = row1[i] * row2[j]
+#             if (k - 1 - j) % 2 == 1:
+#                 coeff = -coeff
+#             coeffs[power] += coeff
+#     # ...existing remainder of function...
+#     sign = (-1) ** (k - 1)
+
+#     for i in range((n - 1) // 2 + 1):
+#         mirror_idx = (n - 1) - i
+#         if mirror_idx != i:
+#             coeffs[mirror_idx] = sign * coeffs[i]
+
+#     negate = neg_k * ((-1) ** ((k - 1) % 2))
+#     const = comb(n - 1, k - 1)
+#     coeffs = [const * (negate * coeff) for coeff in coeffs]
+#     assert all([abs(c1) == abs(c2) for c1, c2 in zip(coeffs, coeffs[::-1])])
+#     return coeffs
+# # ...existing code...
+
+
+# # ...existing code...
+# from functools import lru_cache
+
+# @lru_cache(maxsize=None)
+# def _binomial_row_cached(a_and_upto: tuple[int,int]) -> tuple[int,...]:
+#     a, upto = a_and_upto
+#     row = [1] * (upto + 1)
+#     val = 1
+#     for r in range(1, upto + 1):
+#         val = val * (a - (r - 1)) // r
+#         row[r] = val
+#     return tuple(row)
+# # then call _binomial_row_cached((n-k, i_max))
+# # ...existing code...
+
+
+# # ...existing code...
+# def int_noisepoly_numerators_normalized(n: int, k: int, neg_k: int) -> list[int]:
+#     """Normalize k to the symmetric side and adjust neg_k, then call the core function."""
+#     # choose the smaller side of the symmetry to reduce loop work
+#     if k > (n + 1) // 2:
+#         k = n + 1 - k
+#         # flip neg_k when n is even (because (-1)^(n+1) == -1 for even n)
+#         if (n % 2) == 0:
+#             neg_k = -neg_k
+#     return __int_noisepoly_numerators(n, k, neg_k)
+# # ...existing code...
+
