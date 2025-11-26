@@ -589,7 +589,6 @@ def run_solver(
                     break
                 else:
                     find_idx -= obj_len
-            # print(best_unsat_clauses_idx)
 
     if ttfs:
         logger.info("X-TTFS", ttfs)
@@ -684,7 +683,7 @@ if __name__ == "__main__":
     )
     LOG_LEVELS = ["DEBUG", "INFO", "WARNING", "ERROR"]
     ap.add_argument("file", help="The file to process")
-    ap.add_argument("-p", "--profile", action="store_true", help="Enable profiling")
+    ap.add_argument("-y", "--profile", action="store_true", help="Enable profiling")
     ap.add_argument("-t", "--timeout", type=int, default=300, help="Maximum runtime (timeout seconds)")
     ap.add_argument("-b", "--batch", type=int, default=-1, help="Batch size. -1 computes heuristic maximum")
     ap.add_argument("-f", "--fuzz", type=int, default=0, help="Number of times to attempt fuzzing per batch")
@@ -692,14 +691,11 @@ if __name__ == "__main__":
     ap.add_argument("-n", "--n_devices", type=int, default=n_devices, help="Devices (eg. GPUs) to use. 0 uses all")
     ap.add_argument("-e", "--benchmark", action="store_true", help="Benchmark mode (reduce output)")
     ap.add_argument("-c", "--counting", type=int, default=0, help="Counting mode. Count solns until timeout")
-    ap.add_argument("-w", "--warmup", action="store_true", help="Perform a warmup run before starting timer.")
+    ap.add_argument("-w", "--warmup", action="store_true", help="Perform a warmup run before starting timer")
     ap.add_argument("-d", "--debug", choices=LOG_LEVELS, default="ERROR", help=f"Set logging level ({LOG_LEVELS})")
     ap.add_argument("-s", "--rand_seed", action="store_true", help="Randomise seed")
-    # ap.add_argument("-q", "--q_bench", action="store_true", help="Memory Bench")
-    ap.add_argument(
-        "-y", "--prefix", type=str, default=None, help="A collection of fixed assignments in solution format"
-    )
-    ap.add_argument("-i", "--iters_desc", type=int, default=100, help="Descent iteration depth")
+    ap.add_argument("-p", "--prefix", type=str, default=None, help="Fixed assignments in solution format")
+    ap.add_argument("-i", "--iters_desc", type=int, default=100, help="Solver maximum iterations")
 
     arg = ap.parse_args()
     logger.info(arg._get_args())
