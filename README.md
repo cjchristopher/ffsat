@@ -24,8 +24,8 @@ Optionally, see https://github.com/NVIDIA/JAX-Toolbox for Docker images that may
 
 1. Clone the repository:
    ```bash
-   git clone https://github.com/username/ffsat_imp.git
-   cd ffsat_imp
+   git clone https://github.com/cjchristopher/ffsat.git
+   cd ffsat
    ```
 
 2. Create and activate a virtual environment (recommended):
@@ -45,12 +45,21 @@ Optionally, see https://github.com/NVIDIA/JAX-Toolbox for Docker images that may
 
 ## Dependencies
 
-- JAX and related packages (jaxopt)
-- NumPy
-- tqdm
-- Custom modules included in the repository
+Core dependencies (see `requirements.txt` for complete list with versions):
 
-A complete `requirements.txt` file will be provided in a future update.
+- JAX (0.6.0) and JAX CUDA plugins
+- jaxopt (0.8.5) - Optimization library
+- NumPy (2.2.5)
+- SciPy (1.15.2)
+- tqdm (4.67.1) - Progress bars
+- python-sat (1.8.dev16) - SAT utilities
+- Rich (14.0.0) - Terminal formatting
+- NVIDIA CUDA libraries (CUDA 12.x compatible)
+
+All dependencies can be installed via:
+```bash
+pip install -r requirements.txt
+```
 
 ## Input Format
 
@@ -127,12 +136,18 @@ python ffsat.py [options] input_file.cnf
 ### Command Line Options
 
 - `-t, --timeout INT`: Maximum runtime in seconds (default: 300)
-- `-b, --batch INT`: Batch size for a single GPU (default: -1 = determine dynamically)
-- `-r, --restart INT`: Points to test before adjusting weights and restarting (default: 0, no restart)
-- `-f, --fuzz INT`: Number of fuzzing attempts per batch (default: 0)
-- `-v, --vertex`: Start optimization near vertices
-- `-p, --profile`: Enable profiling
-- `-d, --debug STR`: Enable debugging - STR is one of DEBUG, INFO, WARNING, ERROR, CRITICAL
+- `-b, --batch INT`: Batch size per GPU (default: -1 = compute heuristic maximum)
+- `-r, --restart_thresh INT`: Number of batches before reweighting (default: 0, never reweight)
+- `-f, --fuzz INT`: Number of times to attempt fuzzing per batch (default: 0)
+- `-n, --n_devices INT`: Number of devices (e.g., GPUs) to use (default: all available, 0 = use all)
+- `-i, --iters_desc INT`: Descent iteration depth (default: 100)
+- `-d, --debug LEVEL`: Set logging level: DEBUG, INFO, WARNING, or ERROR (default: ERROR)
+- `-e, --benchmark`: Enable benchmark mode (reduces output verbosity)
+- `-c, --counting INT`: Counting mode - count solutions until timeout (default: 0, disabled)
+- `-w, --warmup`: Perform a warmup run before starting the timer (may improve performance with JAX compilation cache)
+- `-s, --rand_seed`: Randomize the random seed (default: uses fixed seed for reproducibility)
+- `-p, --prefix FILE`: Path to file containing fixed variable assignments (one assignment per line, using SAT solver output format with negated literals)
+- `-y, --profile`: Enable profiling (saves JAX trace to `/tmp/jax-trace` and device memory profile to `memory.prof`)
 
 ### Examples
 
@@ -146,9 +161,29 @@ Running with a 10-minute timeout and specific batch size:
 python ffsat.py problem.cnf -t 600 -b 32
 ```
 
-Enable five fuzzing passes before moving on to next batch:
+Enable five fuzzing passes per batch:
 ```bash
 python ffsat.py problem.cnf -f 5
+```
+
+Run with debugging enabled and profiling:
+```bash
+python ffsat.py problem.cnf -d DEBUG -p
+```
+
+Use a prefix file with fixed variable assignments:
+```bash
+python ffsat.py problem.cnf -p prefix.txt
+```
+
+Use specific number of GPUs with custom iteration depth:
+```bash
+python ffsat.py problem.cnf -n 2 -i 200
+```
+
+Counting mode - find all solutions within 5 minutes:
+```bash
+python ffsat.py problem.cnf -t 300 -c 1
 ```
 
 ## Output
@@ -161,19 +196,36 @@ The solver outputs:
 
 ## Technical Details
 
-The solver uses JAX for hardware acceleration and automatic differentiation. It transforms boolean satisfiability constraints into continuous functions that can be minimized using gradient-based methods, with techniques including:
+The solver uses JAX for hardware acceleration and automatic differentiation. It transforms boolean satisfiability constraints into continuous functions that can be minimized using gradient-based methods.
 
-- Fast Fourier Transform-based representations
-- Projected gradient descent optimization
-- Multi-GPU parallelism through JAX sharding
-- Weight adjustments based on clause difficulty
+### Solver Algorithms
+
+FFSAT supports multiple optimization backends (default: `pgd`):
+
+- **pgd**: Projected Gradient Descent with box constraints (JAXOPT)
+- **lbfgsb**: Limited-memory BFGS with bounds (JAXOPT)
+- **josp-lbfgsb**: JAXOPT's Scipy-wrapped L-BFGS-B
+- **sp-lbfgsb**: Pure Scipy L-BFGS-B (CPU-based, useful for comparison)
+
+Note: The solver algorithm is currently hardcoded in the source. Support for command-line selection may be added in future versions.
+
 
 ## License
 
 [License information will be added here]
 
-## Citation
+## Citations and Related Work
 
-[1] A. Kyrillidis, A. Shrivastava, M. Y. Vardi, and Z. Zhang, ‘Solving hybrid Boolean constraints in continuous space via multilinear Fourier expansions’, Artificial Intelligence, vol. 299. Elsevier BV, p. 103559, Oct. 2021. doi: 10.1016/j.artint.2021.103559. Available: [!http://dx.doi.org/10.1016/j.artint.2021.103559 
+This work builds upon the following research:
 
-[![DOI:10.1016/j.artint.2021.103559](https://zenodo.org/badge/DOI/10.1016/j.artint.2021.103559207-4_15.svg)](https://doi.org/10.1016/j.artint.2021.103559)
+**[1]** Kyrillidis, A., Shrivastava, A., Vardi, M. Y., & Zhang, Z. (2021). *Solving hybrid Boolean constraints in continuous space via multilinear Fourier expansions*. Artificial Intelligence, 299, 103559.
+
+[![DOI](https://img.shields.io/badge/DOI-10.1016%2Fj.artint.2021.103559-blue)](https://doi.org/10.1016/j.artint.2021.103559)
+[![PDF](https://img.shields.io/badge/PDF-Paper-red)](https://akyrillidis.github.io/pubs/Journals/fourierSAT.pdf)
+[![GitHub](https://img.shields.io/badge/GitHub-vardigroup%2FFourierSAT-181717?logo=github)](https://github.com/vardigroup/FourierSAT)
+
+**[2]** Cen, Y., Zhang, Z., & Fong, X. (2025). *Massively Parallel Continuous Local Search for Hybrid SAT Solving on GPUs*. Proceedings of the AAAI Conference on Artificial Intelligence, 39(11), 11140-11149.
+
+[![DOI](https://img.shields.io/badge/DOI-10.1609%2Faaai.v39i11.33211-blue)](https://doi.org/10.1609/aaai.v39i11.33211)
+[![arXiv](https://img.shields.io/badge/arXiv-2308.15020-b31b1b)](https://arxiv.org/abs/2308.15020)
+[![GitHub](https://img.shields.io/badge/GitHub-seeder--research%2FFastFourierSAT-181717?logo=github)](https://github.com/seeder-research/FastFourierSAT)
