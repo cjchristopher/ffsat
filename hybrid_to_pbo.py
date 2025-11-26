@@ -1,13 +1,13 @@
 import sys
 import math
 
-def parse_cardinality_constraint(card, vars):
+def parse_cardinality_constraint(card, vars) -> str:
     # Convert cardinality constraint
     sign = "+"
     try:
         card = int(card)
     except Exception:
-        strict, start = 0, 2 if "=" in card else 1, 1  # we need to adjust by 1 for '<' or '>'
+        strict, start = 0, 2 if "=" in card else 1  # we need to adjust by 1 for '<' or '>'
         if card.startswith(">"):
             card = int(card[start:]) + strict  # e.g. '>3' needs to get to '>=4'.
         elif card.startswith("<"):
@@ -20,13 +20,13 @@ def parse_cardinality_constraint(card, vars):
     return pbo_constraint
 
 
-def parse_exactly_one_constraint(vars):
+def parse_exactly_one_constraint(vars) -> str:
     pbo_vars = [f"+1 {'~x' if v < 0 else 'x'}{abs(v)}" for v in vars]
     pbo_constraint = " ".join(pbo_vars) + " = 1;"
     return pbo_constraint
 
 
-def parse_at_most_one_constraint(vars):
+def parse_at_most_one_constraint(vars) -> str:
     # ideally "+1 xY +1 ~xZ +1 xA <= 1", but sat4j only accepts >= or =.
     # so flip the signs - e.g. {-1 [~]xX} >= -1
     pbo_vars = [f"-1 {'~x' if v < 0 else 'x'}{abs(v)}" for v in vars]
@@ -34,20 +34,20 @@ def parse_at_most_one_constraint(vars):
     return pbo_constraint
 
 
-def parse_cnf_constraint(vars):
+def parse_cnf_constraint(vars) -> str:
     pbo_vars = [f"+1 {'~x' if v < 0 else 'x'}{abs(v)}" for v in vars]
     pbo_constraint = " ".join(pbo_vars) + " >= 1;"
     return pbo_constraint
 
 
-def parse_not_all_equal_constraint(vars):
+def parse_not_all_equal_constraint(vars) -> str:
     # NAE implies that both the CNF and ~CNF read of the clause is SAT.
     pbo_constraint = parse_cnf_constraint(vars)
     pbo_constraint += parse_cnf_constraint([-1 * v for v in vars])
     return pbo_constraint
 
 
-def parse_xor_constraint(vars, var_cnt):
+def parse_xor_constraint(vars, var_cnt) -> tuple[str, int]:
     # Introduces free auxiliary variables so needs to know the total variable count.
     aux_cnt = math.floor(math.log(len(vars), 2)) + 1
     pbo_vars = [f"+1 {'~x' if v < 0 else 'x'}{abs(v)}" for v in vars]
@@ -56,7 +56,7 @@ def parse_xor_constraint(vars, var_cnt):
     return pbo_constraint, aux_cnt
 
 
-def convert_file(input_file, output_file):
+def convert_file(input_file, output_file) -> None:
     with open(input_file, "r") as infile, open(output_file, "w") as outfile:
         var_cnt = 0
         pbo_cons = []
@@ -91,7 +91,7 @@ def convert_file(input_file, output_file):
             pbo_cons.append(pbo_constraint)
 
         # Write file.
-        outfile.write(f"* #variable= {var_cnt} #constraint= {cls_cnt}*\n")
+        outfile.write(f"* #variable= {var_cnt} #constraint= {cls_cnt} *\n")
         for con in pbo_cons:
             outfile.write(con + "\n")
 
