@@ -1,18 +1,21 @@
 from __future__ import annotations
 
+import logging
 import operator as ops
+import os
+import pickle
 from fractions import Fraction
 from itertools import accumulate
 from math import comb
-from typing import NamedTuple
+from typing import NamedTuple, overload
 
 import jax.numpy as jnp
 import numpy as np
-from numpy.typing import NDArray
 from jax import Array
+from numpy.typing import NDArray
 from scipy.stats import binom
 
-from diskcache import FFSATCache
+logger = logging.getLogger(__name__)
 
 type Clause = list[int]
 type Clauses = list[Clause]
@@ -25,8 +28,8 @@ class ClauseSignature(NamedTuple):
 
 
 class FFT(NamedTuple):
-    dft: Array
-    idft: Array
+    dft: Array | NDArray
+    idft: Array | NDArray
 
 
 class ClauseArrays(NamedTuple):
@@ -46,15 +49,69 @@ class Objective(NamedTuple):
 clause_type_ids: dict[str, int] = {"xor": 1, "eo": 2, "nae": 3, "cnf": 4, "amo": 5, "card": 0}
 
 
-# class ClauseGroup:
+# TODO: Implement smart retrieval from disk of precomputed FFT matrices for (c_type, n, k) tuples.
+# Required for meaningful deployment for fast preprocessing.
+class FFSAT_DFTCache:
+    """Unified caching system for FFSAT."""
+
+    def __init__(self, cache_file: str = "") -> None:
+        self.cache_file = cache_file
+        self.memory_cache: dict[ClauseSignature, FFT] = {}
+        self.modified = False
+
+        if cache_file and os.path.exists(cache_file):
+            self._load_cache()
+
+    def _load_cache(self) -> None:
+        """Load cache from disk."""
+        try:
+            with open(self.cache_file, "rb") as f:
+                self.memory_cache = pickle.load(f)
+        except (pickle.PickleError, EOFError):
+            print(f"Warning: Could not load cache from {self.cache_file}, starting with empty cache")
+            self.memory_cache = {}
+
+    def _save_cache(self) -> None:
+        """Save cache to disk."""
+        if not self.cache_file:
+            return
+
+        # Only save if there have been modifications
+        if not self.modified:
+            return
+
+        try:
+            with open(self.cache_file, "wb") as f:
+                pickle.dump(self.memory_cache, f)
+            self.modified = False
+        except (pickle.PickleError, IOError) as e:
+            print(f"Warning: Failed to save cache to {self.cache_file}: {e}")
+
+    def __getitem__(self, key: ClauseSignature) -> FFT:
+        """Get a value from the cache using bracket notation."""
+        value = self.memory_cache.get(key)
+        if value is None:
+            raise KeyError(f"Key {key} not found in cache")
+        return value
+
+    def __setitem__(self, key: ClauseSignature, value: FFT) -> None:
+        """Set a value in the cache using bracket notation."""
+        self.memory_cache[key] = value
+        self.modified = True
+
+    def __contains__(self, key: tuple) -> bool:
+        """Check if a key is in the cache."""
+        return key in self.memory_cache
+
+
 class ClauseProcessor:
-    def __init__(self, n_devices: int = 1, disk_cache: FFSATCache = None) -> None:
+    def __init__(self, n_devices: int = 1, disk_cache: FFSAT_DFTCache | None = None) -> None:
         self.n_devices: int = n_devices
         self.live_cache: dict = {}
-        self.disk_cache: FFSATCache | None = None
+        self.disk_cache: FFSAT_DFTCache | None = None
 
-        if disk_cache and isinstance(disk_cache, FFSATCache):
-            self.disk_cache: dict = disk_cache
+        if disk_cache and isinstance(disk_cache, FFSAT_DFTCache):
+            self.disk_cache = disk_cache
 
     def _wf_coeffs(self, sig: ClauseSignature) -> NDArray:
         """Calculate Walsh-Fourier coefficients for a given clause type.
@@ -138,26 +195,21 @@ class ClauseProcessor:
             For more info see the documenation for __card()
             """
 
-            #TODO: Fix docstring - still the CARD formula.
-            #TODO: Fix implementation.
+            # TODO: Fix implementation.
 
             """
             Compute coefficients of $\rho^{i}$ in $g(\rho) = \frac{1}{n}\binom{n}{k}((2k-n) + np)(1+\rho)^{n-k-1}(1-p)^{k-1}$
             """
-            d = np.zeros(n + 1, dtype=float)
-
             coeff_numers = __int_noisepoly_coeffs(n, k, 1)
-            A = n - k - 1
-            B = k - 1
-            coeff = comb(n, k, exact=True) / n
+            coeff = comb(n, k) / n
 
             # multiply by ((2k - n) + n*p)
-            g[0:len(S)] += (2 * k - n) * S
-            g[1:len(S) + 1] += n * S
+            g = np.zeros(n, dtype=float)
+            g[0 : len(coeff_numers)] += (2 * k - n) * np.array(coeff_numers)
+            g[1 : len(coeff_numers) + 1] += n * np.array(coeff_numers)
 
-            d = np.array([1-(comb(n, k)/(2 ** (n - 1)))] + coeff * g)
+            d = np.array([1 - (comb(n, k) / (2 ** (n - 1)))] + list(coeff * g))
             return d
-
 
         def __nae(n: int) -> NDArray:
             r"""Walsh-Fourier coefficients for not-all-equal (NAE) clauses.
@@ -275,30 +327,37 @@ class ClauseProcessor:
             d = np.array([2 * binom.cdf(k - 1, n, 0.5) - 1] + coeffs)
             return d
 
-        method_map: dict[str, Callable[[int | tuple[int, int]], NDArray]] = {
-            "cnf": __cnf,
-            "eo": __eo,
-            "nae": __nae,
-            "xor": __xor,
-            "amo": __amo,
-            "card": __card,
-        }
+        match sig.type:
+            case "card":
+                return __card(sig.len, sig.card)
+            case "ek":
+                return __ek(sig.len, sig.card)
+            case "cnf":
+                return __cnf(sig.len)
+            case "eo":
+                return __eo(sig.len)
+            case "nae":
+                return __nae(sig.len)
+            case "xor":
+                return __xor(sig.len)
+            case "amo":
+                return __amo(sig.len)
+            case _:
+                raise ValueError(f"Unknown clause type: {sig.type}")
 
-        if sig.type not in method_map:
-            raise ValueError(f"Unknown clause type: {sig.type}")
+    @overload
+    def _pad(self, arrays_list: list[NDArray], pad_val: int | None = 0) -> tuple[NDArray, NDArray]: ...
 
-        if sig.type == "card":
-            if sig.card:
-                return method_map[sig.type](sig.len, sig.card)
-            # Theoretically unreachable
-            raise ValueError("Cardinality clause without specified cardinality")
-        return method_map[sig.type](sig.len)
+    @overload
+    def _pad(self, arrays_list: list[list[Clauses]], pad_val: int | None = 0) -> tuple[NDArray, NDArray]: ...
 
-    def _pad(self, arrays: list[NDArray | list[int]], pad_val: int | None = 0) -> tuple[NDArray, NDArray]:
-        arrays = [np.array(arr) if isinstance(arr, (list, int)) else arr for arr in arrays]
+    @overload
+    def _pad(self, arrays_list: list[list[int]], pad_val: int | None = 0) -> tuple[NDArray, NDArray]: ...
+
+    def _pad(self, arrays_list, pad_val: int | None = 0) -> tuple[NDArray, NDArray]:
+        arrays: list[NDArray] = [np.array(arr) if isinstance(arr, (list, int)) else arr for arr in arrays_list]
         rows = len(arrays)
         if rows > 1:
-            #extra_rows = -rows % self.n_devices
             # TODO: Think about how to handle heterogeneous clause sets when objective sharding is required?
             # N.B. If we ever need to shard objectives then the above will be required for hetero batches.
             # For homogenous batches (1 signature), we would need to adjust the shard spec
@@ -309,6 +368,7 @@ class ClauseProcessor:
             # use n_devices here, so sequencing is something to think about.
             # This will affect types and cards as well. Those leaves will need replication for homogenous
             # objectives, instead of sharding. A fully heterogeneous batch will need sharding at all leaves.
+            # extra_rows = -rows % self.n_devices
             extra_rows = 0
         else:
             extra_rows = 0
@@ -328,7 +388,7 @@ class ClauseProcessor:
         else:
             try:
                 assert np.all([arr.ndim == arrays[0].ndim for arr in arrays])
-            except AssertionError as e:
+            except AssertionError:
                 raise Exception("All sub arrays must have same number of dimensions")
             max_dims = np.max([arr.shape for arr in arrays], axis=0)
             padded_shape = (rows + extra_rows, *max_dims)
@@ -378,13 +438,13 @@ class ClauseProcessor:
                 dft = dft.reshape(-1, 1)
 
                 idft_powers = np.array([[(i * j) % scale for i in range(scale)] for j in range(scale)], dtype=int)
-                idft = np.conjugate(dft[idft_powers].squeeze())
+                idft: NDArray = np.conjugate(dft[idft_powers].squeeze())
                 idft = (coeffs @ idft) / scale
                 clause_fft = FFT(dft, idft)
                 # update caches
                 self.live_cache[sig] = clause_fft
                 if self.disk_cache:
-                    self.disk_cache.put(sig, clause_fft)
+                    self.disk_cache[sig] = clause_fft
 
             dfts.append(clause_fft.dft)
             idfts.append(clause_fft.idft)
@@ -393,7 +453,7 @@ class ClauseProcessor:
         idfts, _ = self._pad(idfts)
         return FFT(dft=jnp.array(dfts), idft=jnp.array(idfts)), jnp.array(dfts_mask)
 
-    def _to_jax_array(self, signatures: list[ClauseSignature], clauses: list[Clauses]) -> ClauseArrays:
+    def _to_jax_array(self, signatures: list[ClauseSignature], clauses: Clauses) -> ClauseArrays:
         lits, mask = self._pad(clauses)
 
         if np.all(lits > 0) or np.all(lits < 0):
@@ -402,7 +462,7 @@ class ClauseProcessor:
             sign = np.where(mask, np.sign(lits), 0)
         sign = jnp.array(sign)
 
-        lits = np.where(mask, np.abs(lits) - 1, lits) #adjust for 0 indexing
+        lits = np.where(mask, np.abs(lits) - 1, lits)  # adjust for 0 indexing
         lits = jnp.array(lits)
         mask = jnp.atleast_2d(jnp.array(mask))
 
@@ -416,28 +476,24 @@ class ClauseProcessor:
 
         return ClauseArrays(lits, sign, mask, types, cards)
 
-    def process(self, signatures: list[ClauseSignature], clauses: Clauses, benchmark: bool) -> Objective:
+    def process(self, signatures: list[ClauseSignature], npclauses: Clauses) -> Objective:
         if len(signatures) > 1:
             try:
-                assert len(signatures) == len(clauses)
-            except AssertionError as e:
-                raise (e("Heterogenous clause group must have equal number of clauses and signatures"))
+                assert len(signatures) == len(npclauses)
+            except AssertionError:
+                raise Exception("Heterogenous clause group must have equal number of clauses and signatures")
 
-        clauses: ClauseArrays = self._to_jax_array(signatures, clauses)
+        clauses: ClauseArrays = self._to_jax_array(signatures, npclauses)
 
         ffts, dft_mask = self._fft(signatures)
-        # dfts = jnp.broadcast_to(ffts.dft, (clauses.lits.shape[0], max(ffts.dft.shape), 1))
-        # ffts = FFT(dft=dfts, idft=ffts.idft)
+
         if jnp.all(dft_mask) and jnp.all(clauses.mask):
             forward_mask = jnp.array([True], dtype=bool)
         else:
             print("Heterogeneous masks", dft_mask.shape, clauses.mask.shape)
             forward_mask = dft_mask & clauses.mask[:, None, :]
-        # TODO:
-        # if self.update_diskcache:
-        #     self._update_diskcache()
-        if not benchmark:
-            print("Processed objective has", clauses.lits.shape[0], "clauses with signature(s):", signatures)
+
+        logger.info("Processed objective has", clauses.lits.shape[0], "clauses with signature(s):", signatures)
         return Objective(clauses=clauses, ffts=ffts, forward_mask=forward_mask)
 
 
@@ -517,4 +573,3 @@ class ClauseProcessor:
 #             neg_k = -neg_k
 #     return __int_noisepoly_numerators(n, k, neg_k)
 # # ...existing code...
-

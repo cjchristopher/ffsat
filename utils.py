@@ -1,8 +1,9 @@
+from __future__ import annotations
+
 import json
 import os
 from dataclasses import dataclass, field
 from typing import Any, Literal
-from typing import Optional as Opt
 
 # TODO: Implement config file passing and setting instead of all command line switches.
 @dataclass
@@ -19,11 +20,8 @@ class FFSATConfig:
         }
     )
 
-    # Formula partitioning configuration
-    partition_strategy: Literal["full", "types", "lens"] = "types"
-
     # Cache configuration
-    cache_file: Opt[str] = None
+    dft_cache: str = ""
 
     # Run configuration
     tasks: int = 32
@@ -49,5 +47,3 @@ class FFSATConfig:
         """Save configuration to a JSON file."""
         with open(filepath, "w") as f:
             json.dump(self.__dict__, f, indent=2)
-
-

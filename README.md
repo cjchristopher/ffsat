@@ -121,7 +121,7 @@ The parser is flexible with shorthand notations for constraint types, allowing f
 Run the solver with:
 
 ```bash
-python ff_shard_test.py input_file.cnf [options]
+python ffsat.py [options] input_file.cnf
 ```
 
 ### Command Line Options
@@ -138,17 +138,17 @@ python ff_shard_test.py input_file.cnf [options]
 
 Basic usage:
 ```bash
-python ff_shard_test.py problem.cnf
+python ffsat.py problem.cnf
 ```
 
 Running with a 10-minute timeout and specific batch size:
 ```bash
-python ff_shard_test.py problem.cnf -t 600 -b 32
+python ffsat.py problem.cnf -t 600 -b 32
 ```
 
 Enable five fuzzing passes before moving on to next batch:
 ```bash
-python ff_shard_test.py problem.cnf -f 5
+python ffsat.py problem.cnf -f 5
 ```
 
 ## Output
