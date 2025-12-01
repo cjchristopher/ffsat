@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0 OR GPL-2.0-or-later
 from __future__ import annotations
 
 import functools
@@ -40,10 +41,10 @@ from typing import TypeAlias, overload
 
 import jax
 import jax.numpy as jnp
+import jax_array_info as jai
 import numpy as np
 from jax import Array
 from jax.sharding import Mesh, NamedSharding
-from jax_array_info import pretty_memory_stats, print_array_stats, sharding_info, sharding_vis, simple_array_info
 from sparklines import sparklines
 from tqdm.auto import tqdm
 

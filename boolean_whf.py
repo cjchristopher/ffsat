@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0 OR GPL-2.0-or-later
 from __future__ import annotations
 
 import logging
@@ -5,6 +6,7 @@ import operator as ops
 import os
 import pickle
 from fractions import Fraction
+from functools import lru_cache
 from itertools import accumulate
 from math import comb
 from typing import NamedTuple, overload
@@ -33,11 +35,11 @@ class FFT(NamedTuple):
 
 
 class ClauseArrays(NamedTuple):
-    lits: Array  # = jnp.empty((0, 0), dtype=int)
-    sign: Array  # = jnp.empty((0, 0), dtype=int)
-    mask: Array  # = jnp.empty((0, 0), dtype=bool)
-    types: Array  # = jnp.empty((0, 0), dtype=int)
-    cards: Array  # = jnp.empty((0, 0), dtype=int)
+    lits: Array
+    sign: Array
+    mask: Array
+    types: Array
+    cards: Array
 
 
 class Objective(NamedTuple):
@@ -49,10 +51,11 @@ class Objective(NamedTuple):
 clause_type_ids: dict[str, int] = {"xor": 1, "eo": 2, "nae": 3, "cnf": 4, "amo": 5, "card": 0}
 
 
-# TODO: Implement smart retrieval from disk of precomputed FFT matrices for (c_type, n, k) tuples.
-# Required for meaningful deployment for fast preprocessing.
 class FFSAT_DFTCache:
     """Unified caching system for FFSAT."""
+
+    # TODO: Implement smart retrieval from disk of precomputed FFT matrices for (c_type, n, k) tuples.
+    # Required for meaningful deployment for fast preprocessing.
 
     def __init__(self, cache_file: str = "") -> None:
         self.cache_file = cache_file
@@ -119,39 +122,89 @@ class ClauseProcessor:
         [Constant, Degree 1 ESP, Degree 2 ESP, ..., Degree C_LEN ESP]
         """
 
-        def __int_noisepoly_coeffs(n: int, k: int, flip_neg_k: int) -> list[int]:
+        @lru_cache(maxsize=None)
+        def _binomial_row(a: int, a_lim: int) -> list[int]:
+            """
+            Compute binomial coefficients $\binom{a}{0}, \binom{a}{1}$,...,$\binom{a}{A_{lim}}$
+            using recurrence relation for safe integer arithmetic.
+            """
+            row = [1] * (a_lim + 1)
+            val = 1
+            for r in range(1, a_lim + 1):
+                val = val * (a - (r - 1)) // r
+                row[r] = val
+            return row
+
+        def __int_noisepoly_coeffs(n: int, A: int, B: int) -> list[int]:
             """Numpy's poly.poly.polyfromroots uses convolutions and changes to float to account for polynomial
             construction from generic roots. For even moderate n (e.g. 120), this causes numerical errors.
             Here our polynomial is monic, and only has roots in {-1, 1}, and so we can use the binomial theorem
             and symmetry explotiation to be faster, and more accurate.
 
+            OLD:
             Compute the coefficients of a polynomial roots -1 ($ n-k $ mutiplicity) and 1 ($ k-1 $ multiplicity).
             Factor in the $(-1)^{k-1}$ and the combinatoric constant multiplier to get the final coefficients.
             """
-            if k < 1 or k > n:
-                raise ValueError("k must satisfy 1 ≤ k ≤ n")
+
+            """
+            Compute coefficients of the polynomial:
+                $\binom{n-1}{B}(1+\rho)^A(1-\rho)^B$
+
+            This is used for constraint polynomials in noise analysis where:
+            - $(1+\rho)$ corresponds to roots at $\rho = -1$
+            - $(1-\rho)$ corresponds to roots at $\rho = 1$
+
+            Args:
+                n: Length of constraint
+                A: Exponent on $(1+\rho)$
+                B: Exponent on $(1-\rho)$
+                negate_result: If True, negate all coefficients (for $<_k$ card constraints)
+
+            Returns:
+                List of n integer coefficients from lowest to highest degree
+            """
+            midpoint = (n - 1) // 2
+            A_max = min(A, midpoint)
+            B_max = min(B, midpoint)
+            row_A = _binomial_row(A, min(A, A_max))
+            row_B = _binomial_row(B, min(B, B_max))
 
             coeffs = [0] * n
-            for i in range((n - k) + 1):
-                for j in range((k - 1) + 1):
-                    power = i + j
-                    if power > (n - 1) // 2:
-                        break
-                    coeff = comb((n - k), i) * comb((k - 1), j)
-                    if (k - 1 - j) % 2 == 1:
-                        coeff = -coeff
-                    coeffs[power] += coeff
-            sign = (-1) ** (k - 1)
 
-            for i in range((n - 1) // 2 + 1):
-                mirror_idx = (n - 1) - i
-                if mirror_idx != i:
-                    coeffs[mirror_idx] = sign * coeffs[i]
+            # $$(1+\rho)^a = \sum \binom{a}{i}\rho^i \quad\quad (1-\rho)^b = \sum \binom{b}{j}(-1)^j\rho^j$$
+            for t in range(midpoint + 1):
+                i_lo = max(0, t - B)
+                i_hi = min(t, A)
+                for i in range(i_lo, i_hi + 1):
+                    j = t - i
+                    # (-1)^j from (1 - rho)^B expansion
+                    term = row_A[i] * row_B[j]
+                    if j % 2 == 1:
+                        term = -term
+                    coeffs[t] += term
+            # for i in range(A_max + 1):
+            #     for j in range(B_max + 1):
+            #         power = i + j
+            #         if power > (n - 1) // 2:
+            #             break
+            #         coeff = row_A[i] * row_B[j]
+            #         # $(-1)^j$ term from $(1-\rho)^B$ expansion
+            #         if j % 2 == 1:
+            #             coeff = -coeff
+            #         coeffs[power] += coeff
 
-            negate = flip_neg_k * ((-1) ** ((k - 1) % 2))
-            const = comb(n - 1, k - 1)
-            coeffs = [const * (negate * coeff) for coeff in coeffs]
-            assert all([abs(c1) == abs(c2) for c1, c2 in zip(coeffs, coeffs[::-1])])
+            # Mirror coefficients using palindromic symmetry
+            sign = (-1) ** B
+            for t in range(midpoint + 1):
+                mirror_idx = (n - 1) - t
+                if mirror_idx != t:
+                    coeffs[mirror_idx] = sign * coeffs[t]
+
+            const = comb(n - 1, B)
+            coeffs = [const * coeff for coeff in coeffs]
+
+            # Sanity check: coefficients should be palindromic up to sign
+            assert all(abs(c1) == abs(c2) for c1, c2 in zip(coeffs, coeffs[::-1]))
             return coeffs
 
         def __cnf(n: int) -> NDArray:
@@ -308,18 +361,6 @@ class ClauseProcessor:
             coeff_denoms = [1] + [numer // denom for numer, denom in zip(pascal_numers, pascal_denoms)]
             coeff_denoms = [coeff * (2**m) for coeff in (coeff_denoms + coeff_denoms[::-1][offset:])]
 
-            # Old numpy impl. Better to just stay in native infinite precision ints.
-            # dtype = np.object_ if n > 64 else np.int64
-            # pascal_numers = np.ones((m//2) + 1, dtype=dtype)
-            # pascal_denoms = np.cumprod(pascal_numers[1:], dtype=dtype)
-            # np.cumprod((m + 1 - pascal_numers[1:]), out=pascal_numers[1:], dtype=dtype)
-            # np.floor_divide(pascal_numers[1:], pascal_denoms, out=pascal_numers[1:])
-            # coeff_denoms = np.concatenate([coeff_denoms, coeff_denoms[::-1][offset:]], dtype=dtype) * 2**m
-            # d = np.zeros(n + 1, dtype=float)
-            # d[0] = 2 * binom.cdf(k - 1, n, 0.5) - 1
-            # d[1:] = (coeff_numers / coeff_denoms)
-            # assert all(np.abs(d[1:]) == np.abs(d[1:][::-1])) # Check symmetry
-
             # Compute the coefficients and check symmetry once more up to signs.
             coeffs = [numer / denom for numer, denom in zip(g_coeffs, coeff_denoms)]
             assert all([abs(c1) == abs(c2) for c1, c2 in zip(coeffs, coeffs[::-1])])
@@ -359,7 +400,7 @@ class ClauseProcessor:
         rows = len(arrays)
         if rows > 1:
             # TODO: Think about how to handle heterogeneous clause sets when objective sharding is required?
-            # N.B. If we ever need to shard objectives then the above will be required for hetero batches.
+            # N.B. If we ever need to shard objectives then the below will be required for hetero batches.
             # For homogenous batches (1 signature), we would need to adjust the shard spec
             # This would indicate the mesh and shard spec should be the first thing we do and should
             # get passed through to this stage.
@@ -368,6 +409,7 @@ class ClauseProcessor:
             # use n_devices here, so sequencing is something to think about.
             # This will affect types and cards as well. Those leaves will need replication for homogenous
             # objectives, instead of sharding. A fully heterogeneous batch will need sharding at all leaves.
+
             # extra_rows = -rows % self.n_devices
             extra_rows = 0
         else:
@@ -495,81 +537,3 @@ class ClauseProcessor:
 
         logger.info("Processed objective has", clauses.lits.shape[0], "clauses with signature(s):", signatures)
         return Objective(clauses=clauses, ffts=ffts, forward_mask=forward_mask)
-
-
-## AI STUFF
-
-# # ...existing code...
-# def _binomial_row(a: int, upto: int) -> list[int]:
-#     # compute C(a,0..upto) using recurrence (safe integer arithmetic)
-#     row = [1] * (upto + 1)
-#     val = 1
-#     for r in range(1, upto + 1):
-#         val = val * (a - (r - 1)) // r
-#         row[r] = val
-#     return row
-
-# def __int_noisepoly_numerators(n: int, k: int, neg_k: int) -> list[int]:
-#     # ...existing code...
-#     if k < 1 or k > n:
-#         raise ValueError("k must satisfy 1 ≤ k ≤ n")
-
-#     coeffs = [0] * n
-#     i_max = min(n - k, (n - 1) // 2)         # max i we may need
-#     j_max = min(k - 1, (n - 1) // 2)         # max j we may need
-
-#     row1 = _binomial_row(n - k, i_max)       # C(n-k, i)
-#     row2 = _binomial_row(k - 1, j_max)       # C(k-1, j)
-
-#     for i in range(i_max + 1):
-#         for j in range(j_max + 1):
-#             power = i + j
-#             if power > (n - 1) // 2:
-#                 break
-#             coeff = row1[i] * row2[j]
-#             if (k - 1 - j) % 2 == 1:
-#                 coeff = -coeff
-#             coeffs[power] += coeff
-#     # ...existing remainder of function...
-#     sign = (-1) ** (k - 1)
-
-#     for i in range((n - 1) // 2 + 1):
-#         mirror_idx = (n - 1) - i
-#         if mirror_idx != i:
-#             coeffs[mirror_idx] = sign * coeffs[i]
-
-#     negate = neg_k * ((-1) ** ((k - 1) % 2))
-#     const = comb(n - 1, k - 1)
-#     coeffs = [const * (negate * coeff) for coeff in coeffs]
-#     assert all([abs(c1) == abs(c2) for c1, c2 in zip(coeffs, coeffs[::-1])])
-#     return coeffs
-# # ...existing code...
-
-
-# # ...existing code...
-# from functools import lru_cache
-
-# @lru_cache(maxsize=None)
-# def _binomial_row_cached(a_and_upto: tuple[int,int]) -> tuple[int,...]:
-#     a, upto = a_and_upto
-#     row = [1] * (upto + 1)
-#     val = 1
-#     for r in range(1, upto + 1):
-#         val = val * (a - (r - 1)) // r
-#         row[r] = val
-#     return tuple(row)
-# # then call _binomial_row_cached((n-k, i_max))
-# # ...existing code...
-
-
-# # ...existing code...
-# def int_noisepoly_numerators_normalized(n: int, k: int, neg_k: int) -> list[int]:
-#     """Normalize k to the symmetric side and adjust neg_k, then call the core function."""
-#     # choose the smaller side of the symmetry to reduce loop work
-#     if k > (n + 1) // 2:
-#         k = n + 1 - k
-#         # flip neg_k when n is even (because (-1)^(n+1) == -1 for even n)
-#         if (n % 2) == 0:
-#             neg_k = -neg_k
-#     return __int_noisepoly_numerators(n, k, neg_k)
-# # ...existing code...

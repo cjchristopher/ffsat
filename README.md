@@ -212,7 +212,22 @@ Note: The solver algorithm is currently hardcoded in the source. Support for com
 
 ## License
 
-[License information will be added here]
+Dual-licensed under:
+
+- Apache License 2.0 (`Apache-2.0`)
+- GNU General Public License v2.0 or later (`GPL-2.0-or-later`)
+
+You may choose either license when using, modifying, or redistributing this project.
+
+Source files use the combined SPDX expression:
+
+```
+SPDX-License-Identifier: Apache-2.0 OR GPL-2.0-or-later
+```
+
+License texts: see `LICENSE-APACHE` (Apache 2.0) and `LICENSE` (GPL v2).
+
+Contributions are accepted under the same dual-license terms.
 
 ## Citations and Related Work
 
