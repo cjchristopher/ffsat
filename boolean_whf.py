@@ -195,32 +195,18 @@ class ClauseProcessor:
             return coeffs
 
         def _coeff_denoms(n: int) -> list[int]:
-            # The denominator for each $|S|$ has a $\binom{n-1}{|S|-1}$ term. Since each subsequent term in the series can be expressed
-            # as the product of the last term and the current term: $S_{i+1} = S_i\cdot(n-i)/(i+1)$, we save time computing the
-            # m = (n-1)th row of Pascal's triangle (where the top is row 0) progressively (vectorised) vs calling comb()
-            # The triangle is left-right symmetric, so m//2+1 is enough. Stay with native int as long as possible.
+            r"""The denominator for each $|S|$ has a $\binom{n-1}{|S|-1}$ term. Since each subsequent term in the series can be expressed
+            as the product of the last term and the current term: $S_{i+1} = S_i\cdot(n-i)/(i+1)$, we save time computing the
+            m = (n-1)th row of Pascal's triangle (where the top is row 0) progressively (vectorised) vs calling comb()
+            The triangle is left-right symmetric, so m//2+1 is enough. Stay with native int as long as possible.
+            """
             m = n - 1
-
-            # offset = (m - 1) % 2
-            # # Calculate the factorial numerator and denominators separately, and integer divide for stability.
-            # # This implements the above recurrence for each subsequent term up to the midpoint of the triangle.
-            # # Then flip and concat - offset in case of unique middle element - and finally scale by $2^{n-1}$
-            # pascal_idx = list(range(1, ((m // 2) + 1)))
-            # pascal_denoms = list(accumulate(pascal_idx, ops.mul))  # cumprod (i*(i+1)*(i+2)...)
-            # pascal_numers = list(accumulate([n - p for p in pascal_idx], ops.mul))  # cumprod ((n-1)*(n-2)*...)
-            # coeff_denoms = [1] + [numer // denom for numer, denom in zip(pascal_numers, pascal_denoms)]
-            # coeff_denoms = [coeff * (1 << m) for coeff in (coeff_denoms + coeff_denoms[::-1][offset:])]
-
             half = m // 2
-            # Use cached row generation for binomial coefficients up to midpoint.
             pascal_half = _binomial_row(m, half)
             if m % 2 == 0:
-                # even: middle element unique, avoid duplicating it
                 full_row = pascal_half + pascal_half[-2::-1]
             else:
-                # odd: central pair duplicated naturally by mirroring entire list
                 full_row = pascal_half + pascal_half[::-1]
-            # Scale by 2^{m} as per original construction logic.
             return [c * (1 << m) for c in full_row]
 
         def __cnf(n: int) -> NDArray:
@@ -318,7 +304,6 @@ class ClauseProcessor:
 
             d = np.arange(-n - 1, n, 2, dtype=float) / (1 << (n - 1))
             d[0] = 1 - (n + 1) / (1 << (n - 1))
-            # TODO: DOUBLE CHECK
             return d
 
         def __card(n: int, k: int) -> NDArray:
