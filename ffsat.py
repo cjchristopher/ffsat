@@ -41,7 +41,7 @@ from typing import TypeAlias, overload
 
 import jax
 import jax.numpy as jnp
-import jax_array_info as jai
+#import jax_array_info as jai
 import numpy as np
 from jax import Array
 from jax.sharding import Mesh, NamedSharding
