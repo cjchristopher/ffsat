@@ -55,7 +55,5 @@ qsub -I -q gpuvolta -P <a00> -l walltime=00:15:00,ncpus=24,ngpus=2,mem=20GB,jobf
    ```
 4. Run as normal:
    ```bash 
-      ffsat.py <problem_file>
-      ```
-   python ff_shard_test.py -c -b 1024 -r 10 -t 300 -m 3 <some_input_file>
+   ffsat.py <problem_file>
    ```
