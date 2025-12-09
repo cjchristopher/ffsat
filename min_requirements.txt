@@ -1,3 +1,4 @@
+sparklines>=0.4.2
 click>=8.1.8
 jax>=0.6.0
 jax-cuda12-pjrt>=0.6.0
