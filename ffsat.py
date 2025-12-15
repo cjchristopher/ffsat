@@ -158,7 +158,7 @@ def shard_tree(target: tuple[Array, ...], sharding: NamedSharding) -> tuple[Arra
 
 def shard_tree(target, sharding) -> tuple[object, ...]:
     mesh = sharding.mesh
-    replication = NamedSharding(mesh, jax.P())
+    replication = NamedSharding(mesh, jax.sharding.PartitionSpec())
 
     def shard_leaf(leaf):
         if isinstance(leaf, jax.Array):
@@ -187,10 +187,10 @@ def get_mesh(devices: list) -> tuple[Mesh, NamedSharding, NamedSharding]:
     mesh = Mesh(np.array(devices).reshape((len(devices), 1)), ("batch", "objective"))
     jax.sharding.set_mesh(mesh)
 
-    objective_spec = jax.P("objective")
+    objective_spec = jax.sharding.PartitionSpec("objective")
     obj_sharding = NamedSharding(mesh, objective_spec)
 
-    batch_spec = jax.P("batch")
+    batch_spec = jax.sharding.PartitionSpec("batch")
     batch_sharding = NamedSharding(mesh, batch_spec)
 
     return mesh, obj_sharding, batch_sharding
