@@ -333,7 +333,8 @@ def run_solver(
     timeout_m, timeout_s = divmod(timeout, 60)
 
     if not benchmark:
-        iters_histo = sparklines({x: 0 for x in range(1, max(101, solver.maxiter + 1))}.values(), num_lines=5)  # type: ignore
+        hist_width = min(os.get_terminal_size().columns, solver.maxiter)
+        iters_histo = sparklines({x: 0 for x in range(1, hist_width)}.values(), num_lines=5)  # type: ignore
         histbars = [tqdm(desc=" ", position=x, bar_format="{desc}", leave=True) for x in range(len(iters_histo))]
         infobars = [tqdm(desc=" ", position=x + len(iters_histo), bar_format="{desc}", leave=True) for x in range(2)]
         pbstr = f"{batches_done % restart_thresh}/{restart_thresh}" if restart_thresh else f"{batches_done} batches"
@@ -465,31 +466,34 @@ def run_solver(
         if not benchmark:
             # Update tqdm info/histogram bars
             opt_iters_counts = Counter(opt_iters_local)
-            if solver.maxiter > 100:
-                bin_width = solver.maxiter / 100
-            else:
-                bin_width = 1
-            iters_histo = [0] * 100
+            bin_width = solver.maxiter / hist_width if solver.maxiter > hist_width else 1
+            iters_histo = [0] * hist_width
             for k, v in opt_iters_counts.items():
                 bin_idx = int(k / bin_width)
-                if bin_idx == 100:
-                    bin_idx = 99
+                if bin_idx == hist_width:
+                    bin_idx -= 1
                 iters_histo[bin_idx] += v
             iters_histo_tq = sparklines(iters_histo, num_lines=5)  # type: ignore
-            if solver.maxiter > 96:
-                pad_bar = " " * (100 - len(str(solver.maxiter)))
-                infobars[0].set_description_str("0" + pad_bar + f"{solver.maxiter}")
+
+            max_iter_str = str(solver.maxiter)
+            max_iter_len = len(max_iter_str)
+            if solver.maxiter >= hist_width:
+                pad_bar = " " * (hist_width - 1 - max_iter_len)
+                infobars[0].set_description_str("0" + pad_bar + max_iter_str)
             else:
-                pad_left = " " * (solver.maxiter - len(str(solver.maxiter)))
-                pad_right = " " * (97 - solver.maxiter)
-                infobars[0].set_description_str("0" + pad_left + f"{solver.maxiter}" + pad_right + "100")
+                end_label = str(hist_width - 1)
+                end_label_len = len(end_label)
+                pad_left = " " * (solver.maxiter - max_iter_len)
+                pad_right = " " * (hist_width - 1 - solver.maxiter - end_label_len)
+                infobars[0].set_description_str("0" + pad_left + max_iter_str + pad_right + end_label)
+
             for x in range(len(histbars)):
                 histbars[x].set_description_str(iters_histo_tq[x])
 
             infobars[-1].set_description_str(
                 f"Optim Iters: min: {jnp.min(opt_iters)}, "
-                + f"max: {jnp.max(opt_iters)} ({iters_histo[solver.maxiter - 1]}), "
-                + f"median: {jnp.median(opt_iters)}"
+                + f"max: {jnp.max(opt_iters)} ({opt_iters_counts[solver.maxiter]}), "
+                + f"median: {int(jnp.median(opt_iters))}"
             )
 
         restart_unsats.extend(np.array(opt_unsat_ct.flatten()).tolist())
@@ -586,7 +590,7 @@ def run_solver(
                         clause = set(((obj.clauses.lits[find_idx] + 1) * obj.clauses.sign[find_idx]).tolist())
                     else:
                         clause = set(((obj.clauses.lits[find_idx] + 1) * obj.clauses.sign).tolist())
-                    print(clause.intersection(assignment), clause)
+                    print(sorted(clause.intersection(assignment)), clause)
                     break
                 else:
                     find_idx -= obj_len

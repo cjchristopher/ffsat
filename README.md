@@ -1,10 +1,13 @@
-# FFSAT: Fast Fourier SAT Solver
+# FFSAT: Fast (GPU Accelerated) Fourier-SAT Solver
 
-FFSAT is a native pseudoboolean Continuous Local Search (CLS) SAT solver that leverages recent developments in closed-form transformations of various pseudoboolean constraint types into continuous multilinear polynomial (which are linear combinations of Elementary Symmetric Polynomials (ESPs) in number of unique variables of the clause). The solver takes advantage of modern automatic differentiation frameworks (JAX) for efficient optimization and can utilize multiple GPUs for fast evaluation of the ESPs via a Discrete Fourier Transform. The work that underpins this can be found at [^1][^2], and this repository reuses some code from the latter (heavily reworked).
+FFSAT is a native pseudo-Boolean (PB) Continuous Local Search (CLS) Satisfiability (SAT) solver that leverages recent developments in closed-form transformations of various pseudo-Boolean constraint types into continuous multilinear polynomial on a one-to-one basis.
 
-## Overview
+The approach takes advantage of the JAX ecosystem, a modern high performance scientific computing framework, leveraging automatic differentiation and efficient optimization for fast distributed GPU kernels.
 
-This solver transforms traditional discrete SAT problems into continuous optimization problems that can be solved using gradient-based methods.
+This work is based on recent theoretical advances by Kyrillidis *et al*[^1] and a proof-of-concept demonstration by Cen *et al*[^2]. The code presented here is an implementation from scratch, and supports arbitrary PB-SAT problems that can be expressed in any combination of the constraint types enumerated below.
+
+A note on naming convention: This does not use *fast Fourier* algorithm. The underlying transform is a *Fourier* transform, hence *Fourier SAT*.
+After this transform, this solver utilises a second discrete Fourier transform for fast polynomial evaluation on GPU, from which the *fast* is derived.
 
 ## Installation
 
@@ -28,7 +31,7 @@ Optionally, see https://github.com/NVIDIA/JAX-Toolbox for Docker images that may
    cd ffsat
    ```
 
-2. Create and activate a virtual environment (recommended):
+2. Create and activate a virtual environment (recommended, your choice of environment management, venv here for illustration):
    ```bash
    python -m venv venv
    source venv/bin/activate  # On Windows: venv\Scripts\activate
@@ -85,35 +88,37 @@ This solver extends the DIMACS format to support various constraint types using 
 2. Supported constraint types:
 
    - **CNF clauses**: Standard disjunction of literals
-     ```
-     1 -2 3 0` or `h 1 -2 3 0
-     ```
+
+     `1 -2 3 0` or `h 1 -2 3 0`
 
    - **XOR constraints**: Exactly one variable must be true
-     ```
-     xor 1 2 3 0 or h x 1 2 3 0 or x 1 2 3 0
-     ```
+
+     `xor 1 2 3 0` or `h x 1 2 3 0` or `x 1 2 3 0`
 
    - **NAE (Not-All-Equal) constraints**: Not all literals can have the same value
-     ```
-     nae 1 2 3 0` or `h n 1 2 3 0` or `n 1 2 3 0
-     ```
+
+     `nae 1 2 3 0` or `h n 1 2 3 0` or `n 1 2 3 0`
 
    - **EO (Exactly-One) constraints**: Exactly one literal must be true
-     ```
-     eo 1 2 3 0` or `h e 1 2 3 0` or `e 1 2 3 0
-     ```
+
+     `eo 1 2 3 0` or `h e 1 2 3 0` or `e 1 2 3 0`
 
    - **AMO (At-Most-One) constraints**: At most one literal can be true
-     ```
-     amo 1 2 3 0` or `h a 1 2 3 0` or `a 1 2 3 0
-     ```
+
+     `amo 1 2 3 0` or `h a 1 2 3 0` or `a 1 2 3 0`
+
+   - **Ek (Exactly-k) constraints**: Exactly k literals must be true
+
+     `ek <k> <literals> 0` or `h k <k> <literals> 0` or `k <k> <literals> 0`
+
+     Where `<k>` is a non-zero positive integer:
+       - `ek 2 1 2 3 0` (at least 2 variables must be true)
+       - `ek 4 1 2 3 4 5 6 0` (more than 2 variables must be true)
 
    - **Cardinality constraints**: Specify how many literals in a set must be true
-     ```
-     card <k> <literals> 0` or `h d <k> <literals> 0` or `d <k> <literals> 0
-     ```
-     
+
+     `card <k> <literals> 0` or `h d <k> <literals> 0` or `d <k> <literals> 0`
+
      Where `<k>` can be:
      - A simple integer: `card 2 1 2 3 0` (at least 2 of the variables must be true)
      - A negative integer: `card -2 1 2 3 0` (fewer than 2 variables must be true)
@@ -123,7 +128,7 @@ This solver extends the DIMACS format to support various constraint types using 
        - `card <2 1 2 3 0` (fewer than 2 variables must be true)
        - `card <=2 1 2 3 0` (at most 2 variables must be true)
 
-The parser is flexible with shorthand notations for constraint types, allowing for both single-character identifiers (`x`, `n`, `e`, `a`, `d`) and full names (`xor`, `nae`, `eo`, `amo`, `card`).
+The parser is flexible with shorthand notations for constraint types, allowing for both single-character identifiers (`x`, `n`, `e`, `a`, `d`, `k`) and full names (`xor`, `nae`, `eo`, `amo`, `card`, `ek`).
 
 ## Usage
 
@@ -205,7 +210,7 @@ FFSAT supports multiple optimization backends (default: `pgd`):
 - **pgd**: Projected Gradient Descent with box constraints (JAXOPT)
 - **lbfgsb**: Limited-memory BFGS with bounds (JAXOPT)
 - **josp-lbfgsb**: JAXOPT's Scipy-wrapped L-BFGS-B
-- **sp-lbfgsb**: Pure Scipy L-BFGS-B (CPU-based, useful for comparison)
+- **sp-lbfgsb**: Scipy L-BFGS-B with JAX compiled objective function
 
 Note: The solver algorithm is currently hardcoded in the source. Support for command-line selection may be added in future versions.
 
@@ -229,18 +234,17 @@ License texts: see `LICENSE-APACHE` (Apache 2.0) and `LICENSE` (GPL v2).
 
 Contributions are accepted under the same dual-license terms.
 
-## Citations and Related Work
-
-This work builds upon the following research:
-
-**[1]** Kyrillidis, A., Shrivastava, A., Vardi, M. Y., & Zhang, Z. (2021). *Solving hybrid Boolean constraints in continuous space via multilinear Fourier expansions*. Artificial Intelligence, 299, 103559.
-
+[^description]: References
+[^1]: Kyrillidis, A., Shrivastava, A., Vardi, M. Y., & Zhang, Z. (2021).
+*Solving hybrid Boolean constraints in continuous space via multilinear Fourier expansions*. 
+Artificial Intelligence, 299, 103559.
 [![DOI](https://img.shields.io/badge/DOI-10.1016%2Fj.artint.2021.103559-blue)](https://doi.org/10.1016/j.artint.2021.103559)
 [![PDF](https://img.shields.io/badge/PDF-Paper-red)](https://akyrillidis.github.io/pubs/Journals/fourierSAT.pdf)
-[![GitHub](https://img.shields.io/badge/GitHub-vardigroup%2FFourierSAT-181717?logo=github)](https://github.com/vardigroup/FourierSAT)
+[![GitHub](https://img.shields.io/badge/GitHub-FourierSAT-181717?logo=github)](https://github.com/vardigroup/FourierSAT)
 
-**[2]** Cen, Y., Zhang, Z., & Fong, X. (2025). *Massively Parallel Continuous Local Search for Hybrid SAT Solving on GPUs*. Proceedings of the AAAI Conference on Artificial Intelligence, 39(11), 11140-11149.
-
+[^2]: Cen, Y., Zhang, Z., & Fong, X. (2025). 
+*Massively Parallel Continuous Local Search for Hybrid SAT Solving on GPUs*. 
+Proceedings of the AAAI Conference on Artificial Intelligence, 39(11), 11140-11149.
 [![DOI](https://img.shields.io/badge/DOI-10.1609%2Faaai.v39i11.33211-blue)](https://doi.org/10.1609/aaai.v39i11.33211)
 [![arXiv](https://img.shields.io/badge/arXiv-2308.15020-b31b1b)](https://arxiv.org/abs/2308.15020)
-[![GitHub](https://img.shields.io/badge/GitHub-seeder--research%2FFastFourierSAT-181717?logo=github)](https://github.com/seeder-research/FastFourierSAT)
+[![GitHub](https://img.shields.io/badge/GitHub-FastFourierSAT-181717?logo=github)](https://github.com/seeder-research/FastFourierSAT)

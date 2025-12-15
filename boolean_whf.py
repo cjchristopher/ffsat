@@ -17,7 +17,6 @@ import jax.numpy as jnp
 import numpy as np
 from jax import Array
 from numpy.typing import NDArray
-from scipy.stats import binom
 
 logger = logging.getLogger(__name__)
 
@@ -126,10 +125,7 @@ class ClauseProcessor:
 
         @lru_cache(maxsize=None)
         def _binomial_row(a: int, a_lim: int) -> list[int]:
-            """
-            Compute binomial coefficients $\binom{a}{0}, \binom{a}{1}$,...,$\binom{a}{A_{lim}}$
-            using recurrence relation for safe integer arithmetic.
-            """
+            r"""Compute binomial coefficients $\binom{a}{0}, \binom{a}{1}$,...,$\binom{a}{A_{lim}}$ using recurrence relation for safe integer arithmetic."""
             S = [1] * (a_lim + 1)
             Si = 1
             symmetry = a // 2
@@ -142,26 +138,24 @@ class ClauseProcessor:
             return S
 
         def __int_noisepoly_coeffs(n: int, A: int, B: int) -> list[int]:
-            """Compute coefficients of the polynomial:
-                $\binom{n-1}{B}(1+\rho)^A(1-\rho)^B$
+            r"""Compute coefficients of the polynomial $(1+\rho)^A(1-\rho)^B$
 
             This is used for constraint polynomials in noise analysis where:
             - $(1+\rho)$ corresponds to roots at $\rho = -1$
             - $(1-\rho)$ corresponds to roots at $\rho = 1$
 
+            Note numpy.poly.poly.polyfromroots uses convolutions and changes to float to account for polynomial
+            construction from generic roots. For even moderate $n$, this can cause numerical errors.
+            Here our polynomial is monic, and only has roots in {-1, 1}, and so we can use the binomial theorem
+            and symmetry exploitation to be much more accurate, and in some cases, faster.
+
             Args:
                 n: Length of constraint
                 A: Exponent on $(1+\rho)$
                 B: Exponent on $(1-\rho)$
-                negate_result: If True, negate all coefficients (for $<_k$ card constraints)
 
             Returns:
                 List of n integer coefficients from lowest to highest degree
-
-            N.B. Numpy's poly.poly.polyfromroots uses convolutions and changes to float to account for polynomial
-            construction from generic roots. For even moderate $n$, this can cause numerical errors.
-            Here our polynomial is monic, and only has roots in {-1, 1}, and so we can use the binomial theorem
-            and symmetry explotiation to be much more accurate, and in some cases, faster.
             """
             midpoint = (n - 1) // 2
             A_max = min(A, midpoint)
@@ -239,7 +233,7 @@ class ClauseProcessor:
                 \widehat{{\texttt{E}_{k}}}(S) &=
                     \begin{dcases}
                         1-\frac{\binom{n}{k}}{2^{n-1}} & \abs{S} = 0 \\
-                        \frac{g_{\texttt{EK}}(\rho)_{[p^{|S|-1}]}}
+                        \frac{g_{\texttt{EK}}(\rho)_{[\rho^{|S|-1}]}}
                              {\binom{n-1}{|S|-1}2^{n-1}} & \abs{S} \neq 0
                     \end{dcases}\\
                 g_{\texttt{EK}}(\rho) &= \frac{((2k-n) + n\rho)}{k}\binom{n-1}{k-1}(1+\rho)^{n-k-1}(1-p)^{k-1}\\
@@ -249,17 +243,17 @@ class ClauseProcessor:
             respectively. For the former use the dedicated routine, for the latter it should be caught prior to this.
             For more info see the documenation for __card()
             """
-            g_coeffs_part = __int_noisepoly_coeffs(n - 1, n - k - 1, k - 1)
             const = comb(n - 1, k - 1)
+            g_coeffs_part = __int_noisepoly_coeffs(n - 1, n - k - 1, k - 1)
             g_coeffs_part = [const * coeff for coeff in g_coeffs_part]
 
-            # multiply by ((2k - n) + n*p)/k
-            g_coeffs = np.zeros(n, dtype=float)
-            g_coeffs[0 : len(g_coeffs_part)] += ((2 * k - n) / k) * np.array(g_coeffs_part)
-            g_coeffs[1 : len(g_coeffs_part) + 1] += (n / k) * np.array(g_coeffs_part)
+            # multiply by $\frac{(2k - n) + n\rho}{k}$, so base coefficient is $\frac{2k-n}{k}$, and for a power above 0, the extra from $\frac{n}{k}$
+            # Integer division is safe here as $g(\rho)$ is a sum of IVPs, and so is an IVP, so //k is safe.
+            g_coeffs_p_base = [(2 * k - n) * g for g in g_coeffs_part] + [0]
+            g_coeffs_p_extra = [0] + [n * g for g in g_coeffs_part]
+            g_coeffs = [(base + extra) // k for base, extra in zip(g_coeffs_p_base, g_coeffs_p_extra)]
 
-            coeff_denoms = _coeff_denoms(n)
-            coeffs = [numer / denom for numer, denom in zip(g_coeffs, coeff_denoms)]
+            coeffs = [numer / denom for numer, denom in zip(g_coeffs, _coeff_denoms(n))]
             d = np.array([1 - (comb(n, k) / (1 << (n - 1)))] + coeffs)
             return d
 
@@ -312,7 +306,7 @@ class ClauseProcessor:
                 \widehat{{\texttt{CARD}_{\geq k}}}(S) &=
                 \begin{dcases}
                     1-\frac{\sum_{i=k}^{n}\binom{n}{i}}{2^{n-1}} & \abs{S} = 0 \\
-                    \frac{g_{\texttt{CARD}}(\rho)_{[p^{|S|-1}]}}{\binom{n-1}{|S|-1}2^{n-1}} & \abs{S} \neq 0
+                    \frac{g_{\texttt{CARD}}(\rho)_{[\rho^{|S|-1}]}}{\binom{n-1}{|S|-1}2^{n-1}} & \abs{S} \neq 0
                 \end{dcases}\\
                 g_{\texttt{CARD}}(\rho) &= \binom{n-1}{k-1}(1+\rho)^{n-k}(1-\rho)^{k-1}
             \end{align*}$$
@@ -337,13 +331,14 @@ class ClauseProcessor:
 
             $k=0$:
                 The clause is trivial and should be dropped instead of evaluated as well - e.g
-                clause $c = \texttt{CARD}^{\geq 0}(x_1, x_2,\ldots)$ is just $FE_c = -1$ (always SAT).
+                clause $c = \texttt{CARD}_{\geq 0}(x_1, x_2,\ldots)$ is just $FE_c = -1$ (always SAT).
 
+            N.B. $\texttt{CARD}_{\geq k} \equiv -\texttt{CARD}_{<k} \equiv \texttt{CARD}_{\leq k-1}$
             These should be detected and handled long before this function is called, but for posterity:
                 $n = k \Rightarrow$ d = np.full(n + 1, (1 /(1 << (n - 1))), dtype=float); d[::2] *= -1; d[0] += 1
                 $k=0\Rightarrow$ d = np.zeros(n + 1, dtype=float); d[0] = -1
             """
-            # Transform formulated for $\geq k$ constraints, so negate $\leq k$ constraints and then correct.
+            # Transform formulated for $\geq k$ constraints, so negate $<k$ constraints and then correct.
             flip_neg_k = int(k / (abs(k)))
             k = abs(k)
 
@@ -351,18 +346,83 @@ class ClauseProcessor:
             # Therefore $g(\rho) = (\rho+1)^{n-k}(\rho-1)^{k-1}(-1)^{k-1}$, and then multiply by combinatoric term $\binom{n-1}{k-1}$
             # We do this ourselves from the $\pm1$ roots for numeric stability.
             g_coeffs = __int_noisepoly_coeffs(n, n - k, k - 1)
-            const = comb(n - 1, k - 1)
+            const = flip_neg_k * comb(n - 1, k - 1)
             g_coeffs = [const * coeff for coeff in g_coeffs]
-            if flip_neg_k:
-                g_coeffs = [flip_neg_k * coeff for coeff in g_coeffs]
-
             coeff_denoms = _coeff_denoms(n)
 
             # Compute the coefficients and check symmetry once more up to signs.
             coeffs = [numer / denom for numer, denom in zip(g_coeffs, coeff_denoms)]
             assert all([abs(c1) == abs(c2) for c1, c2 in zip(coeffs, coeffs[::-1])])
 
-            d = np.array([2 * binom.cdf(k - 1, n, 0.5) - 1] + coeffs)
+            const_term = (
+                1 - (((1 << n) - sum(_binomial_row(n, k - 1))) / (1 << (n - 1)))
+                if k <= n // 2
+                else 1 - (sum(_binomial_row(n, n - k)) / (1 << (n - 1)))
+            )
+            d = np.array([flip_neg_k * const_term] + coeffs)
+            # d = np.array([flip_neg_k * (2 * binom.cdf(k - 1, n, 0.5) - 1)] + coeffs)
+            return d
+
+        def __spectrum(sp: list[int]) -> NDArray:
+            r"""Computes the Walsh-Fourier coefficients for an arbitrary symmetric spectrum.
+            WARNING: This will be slow for complicated spectra, but if you have the spectra for a complicated symmetric
+            contstraint then it is almost certainly likely to be worth the compute trade-off to use this exact form.
+
+            $$\begin{align*}
+                n &= \abs{sp} \\
+                \widehat{{f_{sp}}}(S) &=
+                \begin{dcases}
+                    \frac{1}{2^n}\cdot\sum_{i=0}^{n}\binom{n}{i}sp_i & \abs{S} = 0 \\
+                    \frac{g(\rho)_{[\rho^{|S|-1}]}}{\binom{n-1}{|S|-1}2^{n-1}} & \abs{S} \neq 0
+                \end{dcases}\\
+                g(\rho) &= \sum_{i=0}^{n-1}d_i\binom{n-1}{i}(1+\rho)^{n-1-i}(1-\rho)^{i}\\
+                d_i &= \frac{1}{2}(sp_i - sp_{i+1})\\
+            \end{align*}$$
+            """
+            n = len(sp) - 1
+            d = [(sp[i] - sp[i + 1]) // 2 for i in range(n)]
+            polys = [
+                [comb(n - 1, i) * d[i] * j for j in __int_noisepoly_coeffs(n, n - i - 1, i)] for i in range(n) if d[i]
+            ]
+            g = [sum(i) for i in zip(*polys)]
+            const = sum([comb(n, i) * sp[i] for i in range(10)]) / (2**n)
+            f_exp = np.array([const] + [g[i] / (comb(n - 1, i) * (2 ** (n - 1))) for i in range(len(g))])
+            return f_exp
+
+        def __card_range(n: int, k_l: int, k_u: int) -> NDArray:
+            r"""Construct the WF coefficients for an inclusive range constraint.
+            Easiest way is to just get the relevant card encodings and add them.
+            """
+
+            ## "Faster" version with algebra exploitation?? $g(\rho) = H * Q$ , $d = k_U - k_L$
+            # --- $H(\rho) = (1+\rho)^{n-1-k_U}(1-\rho)^{k_L}$ ---
+            # --- $Q(\rho) = \binom{n-1}{k_L}(1+\rho)^d - \binom{n-1}{k_U}(1-\rho)^d$ ---
+            d = k_u - k_l
+            H = __int_noisepoly_coeffs(n, n - 1 - k_u, k_l)
+            row = _binomial_row(d, d)
+            Q_l, Q_u = comb(n - 1, k_l), comb(n - 1, k_u)
+            Q = [row[j] * (Q_l - ((-1) ** j) * Q_u) for j in range(d + 1)]
+            g_coeffs = [0] * n
+            for j, qj in enumerate(Q):
+                if qj == 0:
+                    continue
+                for i in range(n - j):
+                    g_coeffs[i + j] += qj * H[i]
+
+            # ## "Slower"?? version just computing the two full cardinalities and combine
+            g_coeffs = [
+                L - U  # -U since <k would normally add a -1 multiplier
+                for (L, U) in zip(
+                    [comb(n - 1, k_l - 1) * coeff for coeff in __int_noisepoly_coeffs(n, n - k_l, k_l - 1)],
+                    [comb(n - 1, k_u - 1) * coeff for coeff in __int_noisepoly_coeffs(n, n - k_u, k_u - 1)],
+                )
+            ]
+
+            coeff_denoms = _coeff_denoms(n)
+            coeffs = [numer / denom for numer, denom in zip(g_coeffs, coeff_denoms)]
+            const_term = 1 - sum(_binomial_row(n, k_u)[k_l : k_u + 1]) / (1 << (n - 1))
+            # const_term = (2 * binom.cdf(k_l - 1, n, 0.5) - 1) + -1 * (2 * binom.cdf(k_u - 1, n, 0.5) - 1) + 1
+            d = np.array([const_term] + coeffs)
             return d
 
         match sig.type:

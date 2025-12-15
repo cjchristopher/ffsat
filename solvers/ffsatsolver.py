@@ -82,6 +82,7 @@ def build_eval_verify(objs: tuple[Objective, ...]) -> tuple[tuple[EvalFn, ...], 
                                 jnp.sum(x < 0, axis=1, where=mask) >= jnp.abs(cards),
                                 jnp.sum(x < 0, axis=1, where=mask) < cards,
                             ),
+            "ek": lambda x: jnp.sum(x < 0, axis=1, where=mask) != cards,
         }
 
         def evaluate(x: Array, fixed_vars: Array, weight: Array) -> Array:
