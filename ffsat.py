@@ -54,6 +54,9 @@ from solvers import FFSatSolver, build_eval_verify, seq_eval_verify
 
 logger = logging.getLogger(__name__)
 
+if jax.__version_info__[1] < 7:
+    jax.P = jax.sharding.PartitionSpec
+
 # TODO: Disable x64 when clauses are short enough - find this limit.
 jax.config.update("jax_platform_name", "gpu")  # gpu/cpu/tpu
 jax.config.update("jax_enable_x64", True)
