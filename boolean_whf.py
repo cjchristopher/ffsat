@@ -592,5 +592,5 @@ class ClauseProcessor:
             print("Heterogeneous masks", dft_mask.shape, clauses.mask.shape)
             forward_mask = dft_mask & clauses.mask[:, None, :]
 
-        logger.info("Processed objective has", clauses.lits.shape[0], "clauses with signature(s):", signatures)
+        logger.info(f"Processed objective has {clauses.lits.shape[0]} clauses with signature(s): {signatures}")
         return Objective(clauses=clauses, ffts=ffts, forward_mask=forward_mask)

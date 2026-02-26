@@ -13,7 +13,7 @@ import jax.numpy as jnp
 import numpy as np
 # import optimistix as optx
 from jax import Array
-from jaxopt import LBFGSB, NonlinearCG, ProjectedGradient, ProximalGradient, ScipyBoundedMinimize
+from jaxopt import GradientDescent, LBFGS, LBFGSB, NonlinearCG, ProjectedGradient, ProximalGradient, ScipyBoundedMinimize
 from jaxopt._src import base as job
 from jaxopt.projection import projection_box as box
 from numpy.typing import NDArray
@@ -37,7 +37,7 @@ SeqEvalFn: TypeAlias = Callable[[Array, Array, tuple[Array]], Array | tuple[Arra
 VerifyFn: TypeAlias = Callable[[Array], Array]
 
 
-def build_eval_verify(objs: tuple[Objective, ...]) -> tuple[tuple[EvalFn, ...], tuple[VerifyFn, ...]]:
+def build_eval_verify(objs: tuple[Objective, ...], unbounded: bool) -> tuple[tuple[EvalFn, ...], tuple[VerifyFn, ...]]:
     """
     Constructs JAX-based evaluators and verifiers for a set of objectives.
     This function generates callable evaluators and verifiers for the given objectives by closing over their constants.
@@ -104,7 +104,11 @@ def build_eval_verify(objs: tuple[Objective, ...]) -> tuple[tuple[EvalFn, ...], 
             clause_eval = jnp.sum(esp_eval.real, axis=-1)                         # (N,)
             weighted_eval = weight * clause_eval                                  # (N,) * (N,) = (N,)
             x_eval = jnp.sum(weighted_eval, axis=-1)                              # (1,)
-            return jnp.atleast_1d(x_eval)
+            if not unbounded:
+                return jnp.atleast_1d(x_eval)
+            else:
+            # Affine shift to [0,1]-cube and add error term for unbounded optimisation.
+                return ((jnp.atleast_1d(x_eval)+1)/2)**2 + (x**2 - 1)**(lits.shape[-1])
         # fmt: on
 
         def verify(x: Array) -> Array:
@@ -162,14 +166,33 @@ class FFSatSolver(abc.ABC):
         #     self.solver = BoundedBFGS()
         #     self.solver = optimistix.minimise(evaluator, BoundedBFGS, args={'weights': weights}, has_aux=True)
 
-        if self.sol_name in ["lbfgsb", "pgd", "josp-lbfgsb"]:  # probably change to if sol_name in JAX_OPTIMS
+        if self.sol_name in ["lbfgsb", "pgd", "josp-lbfgsb", "unbounded", "unbounded2"]:
+            # probably change to if sol_name in JAX_OPTIMS
+            if self.sol_name in ["unbounded2"]:
+                lbfgs = LBFGS(fun=evaluator, maxiter=self.maxiter, has_aux=True)
+                logger.info("Setting up JAXOPT Squared L-BFGS:")
+
+                def opt(x: Array, fixed_vars: Array, weights: tuple[Array, ...]) -> tuple[Array, Array, Array, Array]:
+                    x_opt, state = lbfgs.run(init_params=x, fixed_vars=fixed_vars, weights=weights)
+                    unsat = jnp.squeeze(verifier(x_opt))
+                    return x_opt, unsat, jnp.atleast_1d(state.iter_num), state.aux
+
+            if self.sol_name in ["unbounded"]:
+                gd = GradientDescent(fun=evaluator, maxiter=self.maxiter, has_aux=True)
+                logger.info("Setting up JAXOPT Squared L-BFGS:")
+
+                def opt(x: Array, fixed_vars: Array, weights: tuple[Array, ...]) -> tuple[Array, Array, Array, Array]:
+                    x_opt, state = gd.run(init_params=x, fixed_vars=fixed_vars, weights=weights)
+                    unsat = jnp.squeeze(verifier(x_opt))
+                    return x_opt, unsat, jnp.atleast_1d(state.iter_num), state.aux
+
             if self.sol_name in ["lbfgsb"]:
-                bfgsb = LBFGSB(fun=evaluator, maxiter=self.maxiter, has_aux=True)
-                logger.info("Setting up JAXOPT L-BFGS-B:", type(self.solver))
+                lbfgsb = LBFGSB(fun=evaluator, maxiter=self.maxiter, has_aux=True)
+                logger.info("Setting up JAXOPT L-BFGS-B:")
 
                 def opt(x: Array, fixed_vars: Array, weights: tuple[Array, ...]) -> tuple[Array, Array, Array, Array]:
                     bounds = (-1 * jnp.ones_like(x), jnp.ones_like(x))
-                    x_opt, state = bfgsb.run(init_params=x, fixed_vars=fixed_vars, weights=weights, bounds=bounds)
+                    x_opt, state = lbfgsb.run(init_params=x, fixed_vars=fixed_vars, weights=weights, bounds=bounds)
                     unsat = jnp.squeeze(verifier(x_opt))
                     return x_opt, unsat, jnp.atleast_1d(state.iter_num), state.aux
 

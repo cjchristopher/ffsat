@@ -113,34 +113,35 @@ class PBSATFormula(object):
                 UnsatError: If the clause or its implications create an immediate unsatisfiability
                            (e.g., conflicting unit literals, card > n).
             """
-            h_offset = 0
-            if tokens[0] == "h" or (tokens[0] == "1" and tokens[1] == "x"):  # "1 x" valid when using "h"
-                h_offset = 1
+            lit_offset = 0
+            clause_type = "cnf" # default assumption
 
-            clause_type = tokens[h_offset] if tokens[h_offset].isalpha() else "cnf"
+            if tokens[0] == "h" or (tokens[0] == "1" and tokens[1] == "x"):  # "1 x" valid when using "h"
+                lit_offset = 1
+            if tokens[lit_offset].isalpha():
+                # First part of clause is always after the (optional) h and clause type (unless cnf)
+                clause_type = tokens[lit_offset] if tokens[lit_offset].isalpha() else "cnf"
+                lit_offset += 1
             canon_types = {"d": "card", "x": "xor", "n": "nae", "e": "eo"}
             clause_type = canon_types[clause_type] if clause_type in canon_types else clause_type
             if clause_type not in clause_type_ids:
                 logger.error(f"Unknown clause type: {line}")
                 raise ValueError
 
-            # First part of clause is always after the (optional) h and clause type (unless cnf)
-            first_lit_or_card = h_offset if clause_type == "cnf" else (h_offset + 1)
-
-            if first_lit_or_card >= len(tokens) - 1:
+            if lit_offset >= len(tokens) - 1:
                 logger.error(f"Line {idx}: Malformed clause: {line}")
                 raise ValueError
 
             if clause_type in ("card", "ek"):
                 # Catch implicit inequality (is just an int) - e.g. >= card or < card (for negative)
                 try:
-                    card = int(tokens[first_lit_or_card])
+                    card = int(tokens[lit_offset])
 
                 # Must have an explicit inequality indicator or is malformed/typo
                 except ValueError:
                     # Check for strict inequality. All cardinality clauses are normalised to default forms:
                     # ">=" or "<", so we adjust the sign and value of k (card).
-                    ineq = tokens[first_lit_or_card]
+                    ineq = tokens[lit_offset]
                     if ineq[0] in ("<", ">") and clause_type == "card":
                         negate = ineq[0] == "<"
                         equality = ineq[1] == "="
@@ -153,11 +154,11 @@ class PBSATFormula(object):
                     else:
                         logger.error(f"Line {idx}: EK constraint cannot have inequality: {line}")
                         raise ValueError
-                first_lit_or_card += 1
+                lit_offset += 1
             else:
                 card = 0
 
-            lits = [int(val) for val in tokens[first_lit_or_card:-1]]  # drop trailing 0
+            lits = [int(val) for val in tokens[lit_offset:-1]] # drop trailing 0
             n = len(lits)
 
             # Clause extracted. Check for errors in spec, correct generic edge cases.
@@ -228,7 +229,6 @@ class PBSATFormula(object):
 
         try:
             with open(dimacs_file, "r") as f:
-                self.h_offset = -1  # Reset flag
                 for idx, ln in enumerate(f):
                     tokens = ln.split()
                     line = ln.strip()
@@ -240,9 +240,12 @@ class PBSATFormula(object):
                     # Problem metadata
                     elif tokens[0] == "p":
                         print(len(tokens), tokens)
-                        if len(tokens) == 3 or len(tokens) == 4:
+                        if len(tokens) == 4:
                             self.n_var = int(tokens[-2])
                             self.n_clause = int(tokens[-1])
+                        elif len(tokens) == 5:
+                            self.n_var = int(tokens[-3])
+                            self.n_clause = int(tokens[-2])
                         else:
                             logger.error(f"Line {idx}: Malformed problem specification: {line}")
                             raise ValueError
@@ -337,6 +340,7 @@ class PBSATFormula(object):
         # race conditions deep in XLA (see jax.config.update("jax_persistent_cache_enable_xla_caches", "all"))
         objectives = parallel_clause_process(clause_grps, workers=min(len(clause_grps), self.workers))
         objectives = tuple(sorted(objectives, key=lambda x: x.clauses.lits.shape[-1]))
+        self.n_clause = sum([o.clauses.lits.shape[0] for o in objectives])
         return objectives
 
     def process_prefix(self, prefix_file: str) -> NDArray:
@@ -349,23 +353,38 @@ class PBSATFormula(object):
 
         try:
             vecs = []
-            if self.unit_prefix:
+            if prefix_file:
+                skipped = 0
+                total = 0
+                with open(prefix_file, "r") as f:
+                    for idx, line in enumerate(f):
+                        prefix_lits = line.strip().split()
+                        if not prefix_lits or prefix_lits[0] in ("c", "#", "*"):
+                            continue
+                        total += 1
+                        try:
+                            prefix_lits = set(int(lit) for lit in prefix_lits)
+                            # Invert and check for overlap implies a conflict between the problem and the prefix.
+                            neg_lits = set(-lit for lit in prefix_lits)
+                            conflict = self.unit_prefix.intersection(neg_lits)
+                            if conflict:
+                                logger.warning(
+                                    f"Conflict ({conflict}) with unit literals in prefix-{idx}- skipping: {line}")
+                                skipped += 1
+                                continue
+                            merged = prefix_lits | self.unit_prefix
+                            vecs.append(__lits_to_prefix(merged))
+                        except (ValueError, TypeError):
+                            logger.warning(f"Line {idx}: Invalid prefix entry: {line.strip()}")
+                            continue
+                if total > 0 and skipped == total:
+                    logger.error("All prefixes skipped due to conflicts with unit literals or malformation")
+                    raise UnsatError
+
+            if not vecs and self.unit_prefix:
+                # No prefix file or no valid file prefixes — unit literals are the sole prefix
                 vecs.append(__lits_to_prefix(self.unit_prefix))
-            with open(prefix_file, "r") as f:
-                for idx, line in enumerate(f):
-                    lits = line.strip().split()
-                    if lits[0] in ("c", "#", "*"):
-                        continue
-                    try:
-                        lits = set(-int(lit) for lit in lits)
-                        conflict = self.unit_prefix.intersection(lits)
-                        if conflict:
-                            logger.error(f"Conflict ({conflict}) found among unit literals with prefix-{idx} - {line}")
-                            raise UnsatError
-                        vecs.append(__lits_to_prefix(lits))
-                    except Exception:
-                        logger.warning(f"Line {idx}: Invalid prefix entry: {line.strip()}")
-                        continue
+
             prefixes = np.delete(np.stack(vecs), 0, axis=1)  # purge leading zeros.
             return prefixes
 
