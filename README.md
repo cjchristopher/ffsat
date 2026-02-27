@@ -214,7 +214,6 @@ FFSAT supports multiple optimization backends (default: `pgd`):
 
 Note: The solver algorithm is currently hardcoded in the source. Support for command-line selection may be added in future versions.
 
-
 ## License
 
 Dual-licensed under:
@@ -234,17 +233,17 @@ License texts: see `LICENSE-APACHE` (Apache 2.0) and `LICENSE` (GPL v2).
 
 Contributions are accepted under the same dual-license terms.
 
-[^description]: References
-[^1]: Kyrillidis, A., Shrivastava, A., Vardi, M. Y., & Zhang, Z. (2021).
-*Solving hybrid Boolean constraints in continuous space via multilinear Fourier expansions*. 
+#### References
+1: Kyrillidis, A., Shrivastava, A., Vardi, M. Y., & Zhang, Z. (2021).
+*Solving hybrid Boolean constraints in continuous space via multilinear Fourier expansions*.
 Artificial Intelligence, 299, 103559.
 [![DOI](https://img.shields.io/badge/DOI-10.1016%2Fj.artint.2021.103559-blue?logo=doi)](https://doi.org/10.1016/j.artint.2021.103559)
-[![PDF](https://img.shields.io/badge/PDF-Paper-red)](https://akyrillidis.github.io/pubs/Journals/fourierSAT.pdf)
+[![arXiv](https://img.shields.io/badge/PDF-Paper-red)](https://akyrillidis.github.io/pubs/Journals/fourierSAT.pdf)
 [![GitHub](https://img.shields.io/badge/GitHub-FourierSAT-181717?logo=github)](https://github.com/vardigroup/FourierSAT)
 
-[^2]: Cen, Y., Zhang, Z., & Fong, X. (2025). 
-*Massively Parallel Continuous Local Search for Hybrid SAT Solving on GPUs*. 
+2: Cen, Y., Zhang, Z., & Fong, X. (2025).
+*Massively Parallel Continuous Local Search for Hybrid SAT Solving on GPUs*.
 Proceedings of the AAAI Conference on Artificial Intelligence, 39(11), 11140-11149.
 [![DOI](https://img.shields.io/badge/DOI-10.1609%2Faaai.v39i11.33211-blue?logo=doi)](https://doi.org/10.1609/aaai.v39i11.33211)
-[![PDF](https://img.shields.io/badge/arXiv-2308.15020-b31b1b)](https://arxiv.org/abs/2308.15020)
+[![arXiv](https://img.shields.io/badge/arXiv-2308.15020-b31b1b)](https://arxiv.org/abs/2308.15020)
 [![GitHub](https://img.shields.io/badge/GitHub-FastFourierSAT-181717?logo=github)](https://github.com/seeder-research/FastFourierSAT)
