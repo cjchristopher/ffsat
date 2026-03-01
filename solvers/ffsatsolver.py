@@ -11,13 +11,22 @@ from typing import TypeAlias
 import jax
 import jax.numpy as jnp
 import numpy as np
+
 # import optimistix as optx
 from jax import Array
-from jaxopt import GradientDescent, LBFGS, LBFGSB, NonlinearCG, ProjectedGradient, ProximalGradient, ScipyBoundedMinimize
+from jaxopt import (
+    GradientDescent,
+    LBFGS,
+    LBFGSB,
+    NonlinearCG,
+    ProjectedGradient,
+    ProximalGradient,
+    ScipyBoundedMinimize,
+)
 from jaxopt._src import base as job
 from jaxopt.projection import projection_box as box
 from numpy.typing import NDArray
-# from optimistix import BoundedLBFGS
+
 from scipy.optimize import Bounds, OptimizeResult
 from scipy.optimize import minimize as ScipyMinimize
 

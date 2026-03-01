@@ -343,7 +343,7 @@ class PBSATFormula(object):
         self.n_clause = sum([o.clauses.lits.shape[0] for o in objectives])
         return objectives
 
-    def process_prefix(self, prefix_file: str) -> NDArray:
+    def process_prefix(self, prefix_file: str) -> NDArray | None:
         def __lits_to_prefix(lits: Iterable[int]) -> NDArray:
             vec = np.zeros(self.n_var + 1, dtype=int)
             lit_vec = np.array([int(lit) for lit in lits], dtype=int)
@@ -385,8 +385,11 @@ class PBSATFormula(object):
                 # No prefix file or no valid file prefixes — unit literals are the sole prefix
                 vecs.append(__lits_to_prefix(self.unit_prefix))
 
-            prefixes = np.delete(np.stack(vecs), 0, axis=1)  # purge leading zeros.
-            return prefixes
+            if vecs:
+                prefixes = np.delete(np.stack(vecs), 0, axis=1)  # purge leading zeros.
+                return prefixes
+            else:
+                return None
 
         except FileNotFoundError as e:
             print(f"Error: File '{prefix_file}' not found")

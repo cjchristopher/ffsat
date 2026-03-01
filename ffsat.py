@@ -250,6 +250,7 @@ def run_solver(
 ) -> float:
     devices = jax.devices("gpu")[:n_devices]
     n_prefix = len(prefix_vectors) if prefix_vectors is not None else 1
+    print(prefix_vectors, n_prefix)
 
     mesh, obj_sharding, batch_sharding = get_mesh(devices)
     jax.sharding.set_mesh(mesh)
@@ -540,7 +541,7 @@ def run_solver(
 
             if not (batches_done % restart_thresh):
                 # Gather unsat counts by clause
-                penalty = jnp.concatenate(restart_batch_unsats, axis=1).sum(axis=0)
+                penalty = jnp.atleast_1d(jnp.concatenate(restart_batch_unsats, axis=1).sum(axis=0))
                 worst = penalty.max()
 
                 logger.debug(f"# Restart: {restart_ct} | Current  (#unsat): {best_unsat}")
@@ -685,7 +686,8 @@ def main(
     objectives = sat_parser.process_clauses_to_array()
     n_var = sat_parser.n_var
     n_clause = sat_parser.n_clause
-    prefixes = jnp.array(sat_parser.process_prefix(prefix_file))
+    prefixes = sat_parser.process_prefix(prefix_file)
+    prefixes = jnp.array(prefixes) if prefixes else None
     stamp1 = time()
     process_time = stamp1 - stamp2
 
