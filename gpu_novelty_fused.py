@@ -37,7 +37,7 @@ from collections.abc import Callable
 from typing import TypeAlias
 
 import jax
-import jax.experimental.host_callback
+from jax.experimental import io_callback
 import jax.numpy as jnp
 import numpy as np
 from jax import Array
@@ -76,7 +76,7 @@ class BeamState(NamedTuple):
     iter_count: Array       # () iteration counter
     rng_key: Array          # PRNG state
     done: Array             # () bool, early exit flag
-    prefix_idx: Array       # (batch_size,) int32, maps each point to its prefix (multi-prefix)
+    weights: Array          # (n_clauses,) clause weights
 
 
 def build_verifier(cls: tuple[ClauseArrays, ...]) -> VerifyFn:
@@ -149,7 +149,7 @@ def make_gpu_inner_loop(
     # Single-prefix support (all points share one prefix)
     fixed_mask_1d: Array | None = None,
     prefix_bools_1d: Array | None = None,
-    # Multi-prefix support (different prefixes per point)
+    # Multi-prefix support (vmap over prefix groups)
     all_fixed_masks: Array | None = None,
     all_prefix_bools: Array | None = None,
     n_prefix: int = 0,
@@ -160,15 +160,23 @@ def make_gpu_inner_loop(
       - No prefix:      flip_mask is (n_vars, n_vars), n_flip == n_vars.
       - Single prefix:  flip_mask is (n_free, n_vars), n_flip == n_free.
                          fixed_mask_1d / prefix_bools_1d are (n_vars,).
-      - Multi-prefix:   flip_mask is (n_vars, n_vars), n_flip == n_vars.
-                         Penalty applied per-point via all_fixed_masks lookup.
-                         prefix_idx tracked through BeamState for selection.
+      - Multi-prefix:   flip_mask is (n_prefix, max_n_free, n_vars), n_flip == max_n_free.
+                         Padded zero-rows produce duplicate candidates (harmless waste
+                         proportional to the gap between longest and shortest prefix).
+                         Expand and select are vmapped over prefix groups — no
+                         per-point prefix tracking needed.
     """
 
     n_expanded = batch_size * top_m
     single_prefix = fixed_mask_1d is not None
     multi_prefix = all_fixed_masks is not None
-    BIG_PENALTY = 1e10
+
+    # Per-group constants for multi-prefix
+    if multi_prefix:
+        assert all_fixed_masks is not None and all_prefix_bools is not None
+        ppg = batch_size // n_prefix              # points per group
+        n_cull_pg = n_cull // n_prefix
+        n_keep_pg = ppg - n_cull_pg
 
     # Host-side solution collection
     collected_solutions: list[np.ndarray] = []
@@ -185,155 +193,148 @@ def make_gpu_inner_loop(
     def clear_solutions() -> None:
         collected_solutions.clear()
 
-    def beam_expand(
-        points: Array, weights: Array, rng_key: Array,
-        point_fixed_masks: Array | None = None,
-    ) -> tuple[Array, Array, Array]:
-        """Expand all points to their best neighbors.
+    # ─── Expand / select for no-prefix and single-prefix ─────────────────
 
-        Args:
-            point_fixed_masks: (batch_size, n_vars) bool penalty mask for multi-prefix.
-                               None for no-prefix and single-prefix modes.
-        """
+    def beam_expand(points: Array, weights: Array, rng_key: Array) -> tuple[Array, Array, Array]:
+        """Expand all points to their best neighbors (no-prefix / single-prefix)."""
         keys = jax.random.split(rng_key, batch_size)
 
-        if multi_prefix and point_fixed_masks is not None:
-            def single_point_step_mp(
-                point: Array, point_mask: Array, key: Array,
-            ) -> tuple[Array, Array, Array]:
-                candidates = point ^ flip_mask  # (n_vars, n_vars)
-                weighted_scores, unsat_masks = verifier(candidates, weights)
-                unsat_counts = jnp.sum(unsat_masks, axis=-1)
-                noise = jax.random.uniform(key, shape=(n_flip,), minval=0, maxval=0.5)
-                noisy_scores = weighted_scores + noise
-                # Penalise flipping any fixed variable for this point.
-                noisy_scores = noisy_scores + point_mask * BIG_PENALTY
+        def single_point_step(point: Array, key: Array) -> tuple[Array, Array, Array]:
+            candidates = point ^ flip_mask  # (n_flip, n_vars)
+            weighted_scores, unsat_masks = verifier(candidates, weights)
+            unsat_counts = jnp.sum(unsat_masks, axis=-1)
+            noise = jax.random.uniform(key, shape=(n_flip,), minval=0, maxval=0.5)
+            noisy_scores = weighted_scores + noise
 
-                if top_m > 1:
-                    top_idx = jnp.argsort(noisy_scores)[:top_m]
-                    return candidates[top_idx], unsat_counts[top_idx], unsat_masks[top_idx]
-                else:
-                    best = jnp.argmin(noisy_scores)
-                    return candidates[best], unsat_counts[best], unsat_masks[best]
+            if top_m > 1:
+                top_idx = jnp.argsort(noisy_scores)[:top_m]
+                return candidates[top_idx], unsat_counts[top_idx], unsat_masks[top_idx]
+            else:
+                best = jnp.argmin(noisy_scores)
+                return candidates[best], unsat_counts[best], unsat_masks[best]
 
-            neighbors, unsats, masks = jax.vmap(single_point_step_mp)(
-                points, point_fixed_masks, keys,
-            )
-        else:
-            def single_point_step(point: Array, key: Array) -> tuple[Array, Array, Array]:  # type: ignore[misc]
-                candidates = point ^ flip_mask  # (n_flip, n_vars)
-                weighted_scores, unsat_masks = verifier(candidates, weights)
-                unsat_counts = jnp.sum(unsat_masks, axis=-1)
-                #jax.debug.print("{}, {}", weighted_scores.shape, unsat_counts.shape)
-                noise = jax.random.uniform(key, shape=(n_flip,), minval=0, maxval=0.5)
-                noisy_scores = weighted_scores + noise
+        neighbors, unsats, masks = jax.vmap(single_point_step)(points, keys)
+        return neighbors.reshape(-1, n_vars), unsats.reshape(-1), masks.reshape(-1, n_clauses)
 
-                if top_m > 1:
-                    top_idx = jnp.argsort(noisy_scores)[:top_m]
-                    return candidates[top_idx], unsat_counts[top_idx], unsat_masks[top_idx]
-                else:
-                    best = jnp.argmin(noisy_scores)
-                    return candidates[best], unsat_counts[best], unsat_masks[best]
-
-            neighbors, unsats, masks = jax.vmap(single_point_step)(points, keys)
-
-        return (
-            neighbors.reshape(-1, n_vars),
-            unsats.reshape(-1),
-            masks.reshape(-1, n_clauses),
-        )
-
-    def select_and_refill(
-        expanded: Array, unsat_masks: Array, weights: Array, fill_key: Array,
-        expanded_prefix_idx: Array | None = None,
-    ) -> tuple[Array, Array]:
-        """Select top candidates, cull worst and refill with random if beta > 0.
-
-        Returns:
-            (new_points, new_prefix_idx)
-        """
+    def select_and_refill(expanded: Array, unsat_masks: Array, weights: Array, fill_key: Array) -> Array:
+        """Select top candidates and optionally refill (no-prefix / single-prefix)."""
         scores = jnp.sum(unsat_masks.astype(jnp.float32) * weights, axis=-1)
         sorted_idx = jnp.argsort(scores)
         kept = expanded[sorted_idx[:n_keep]]
 
-        # Track prefix assignment through selection
-        if expanded_prefix_idx is not None:
-            kept_prefix_idx = expanded_prefix_idx[sorted_idx[:n_keep]]
-        else:
-            kept_prefix_idx = jnp.zeros(n_keep, dtype=jnp.int32)
-
         if n_cull > 0:
             random_fill = jax.random.bernoulli(fill_key, p=0.5, shape=(n_cull, n_vars))
-
-            # Apply prefix values to random fills
             if single_prefix:
                 assert fixed_mask_1d is not None and prefix_bools_1d is not None
                 random_fill = jnp.where(fixed_mask_1d, prefix_bools_1d, random_fill)
-                fill_prefix_idx = jnp.zeros(n_cull, dtype=jnp.int32)
-            elif multi_prefix:
-                assert all_fixed_masks is not None and all_prefix_bools is not None
-                # Round-robin prefix assignment for refills
-                fill_prefix_idx = jnp.arange(n_cull, dtype=jnp.int32) % n_prefix
-                fill_masks = all_fixed_masks[fill_prefix_idx]    # (n_cull, n_vars)
-                fill_values = all_prefix_bools[fill_prefix_idx]  # (n_cull, n_vars)
-                random_fill = jnp.where(fill_masks, fill_values, random_fill)
-            else:
-                fill_prefix_idx = jnp.zeros(n_cull, dtype=jnp.int32)
+            return jnp.concatenate([kept, random_fill], axis=0)
+        return kept
 
-            new_points = jnp.concatenate([kept, random_fill], axis=0)
-            new_prefix_idx = jnp.concatenate([kept_prefix_idx, fill_prefix_idx], axis=0)
-            return new_points, new_prefix_idx
+    # ─────────────────────────────────────────────────────────────────────
 
-        return kept, kept_prefix_idx
+    def make_inner_loop(n_iters: int):
+        """Create JIT-compiled inner loop for given iteration count.
 
-    def make_inner_loop(weights: Array, n_iters: int):
-        """Create JIT-compiled inner loop for given weights and iteration count."""
+        Weights are read dynamically from BeamState.weights — no recompilation
+        needed when weights change between restarts.
+        """
 
         def body_fn(state: BeamState) -> BeamState:
+            weights = state.weights
             rng_key, step_key, fill_key = jax.random.split(state.rng_key, 3)
 
-            # Build per-point fixed masks for multi-prefix penalty
-            point_fixed_masks = None
             if multi_prefix:
-                assert all_fixed_masks is not None
-                point_fixed_masks = all_fixed_masks[state.prefix_idx]  # (batch, n_vars)
+                # ─── Multi-prefix: double vmap (prefix_groups × points) ──
+                assert all_fixed_masks is not None and all_prefix_bools is not None
+                grouped = state.points.reshape(n_prefix, ppg, n_vars)
+                group_step_keys = jax.random.split(step_key, n_prefix)
+                group_fill_keys = jax.random.split(fill_key, n_prefix)
 
-            # Expand
-            expanded, unsats, unsat_masks = beam_expand(
-                state.points, weights, step_key, point_fixed_masks,
-            )
+                def expand_group(
+                    group_pts: Array, group_mask: Array, gkey: Array,
+                ) -> tuple[Array, Array, Array]:
+                    pkeys = jax.random.split(gkey, ppg)
+                    def step(point: Array, key: Array) -> tuple[Array, Array, Array]:
+                        candidates = point ^ group_mask  # (n_flip, n_vars)
+                        w_scores, u_masks = verifier(candidates, weights)
+                        u_counts = jnp.sum(u_masks, axis=-1)
+                        noise = jax.random.uniform(key, shape=(n_flip,), minval=0, maxval=0.5)
+                        noisy = w_scores + noise
+                        if top_m > 1:
+                            idx = jnp.argsort(noisy)[:top_m]
+                            return candidates[idx], u_counts[idx], u_masks[idx]
+                        else:
+                            b = jnp.argmin(noisy)
+                            return candidates[b], u_counts[b], u_masks[b]
+                    nbrs, us, ms = jax.vmap(step)(group_pts, pkeys)
+                    return nbrs.reshape(-1, n_vars), us.reshape(-1), ms.reshape(-1, n_clauses)
 
-            # Accumulate for reweighting
-            new_clause_totals = state.clause_totals + unsat_masks.sum(axis=0).astype(jnp.float32)
+                expanded_g, unsats_g, masks_g = jax.vmap(expand_group)(
+                    grouped, flip_mask, group_step_keys,
+                )
+                # expanded_g: (n_prefix, ppg*top_m, n_vars)
+                # unsats_g:   (n_prefix, ppg*top_m)
+                # masks_g:    (n_prefix, ppg*top_m, n_clauses)
 
-            # Find best this iteration
-            best_idx = jnp.argmin(unsats)
-            iter_best = expanded[best_idx]
-            iter_best_unsat = unsats[best_idx]
-            #jax.debug.print("{}, {}, {}", best_idx, iter_best, iter_best_unsat)
+                # Flatten for global operations
+                expanded = expanded_g.reshape(-1, n_vars)
+                unsats = unsats_g.reshape(-1)
+                unsat_masks = masks_g.reshape(-1, n_clauses)
 
-            # Update global best
-            is_better = iter_best_unsat < state.best_unsat
-            new_best_candidate = jnp.where(is_better, iter_best, state.best_candidate)
-            new_best_unsat = jnp.minimum(iter_best_unsat, state.best_unsat)
+                # Accumulate
+                new_clause_totals = state.clause_totals + unsat_masks.sum(axis=0).astype(jnp.float32)
 
-            # Track prefix_idx through expansion (each point produces top_m children)
-            expanded_prefix_idx = jnp.repeat(state.prefix_idx, top_m) if multi_prefix else None
+                # Global best
+                best_idx = jnp.argmin(unsats)
+                iter_best = expanded[best_idx]
+                iter_best_unsat = unsats[best_idx]
+                is_better = iter_best_unsat < state.best_unsat
+                new_best_candidate = jnp.where(is_better, iter_best, state.best_candidate)
+                new_best_unsat = jnp.minimum(iter_best_unsat, state.best_unsat)
 
-            # Selection
-            new_points, new_prefix_idx = select_and_refill(
-                expanded, unsat_masks, weights, fill_key, expanded_prefix_idx,
-            )
+                # Per-group selection with prefix-aware refill
+                def select_group(
+                    g_exp: Array, g_masks: Array,
+                    g_fixed: Array, g_bools: Array, g_fkey: Array,
+                ) -> Array:
+                    scores = jnp.sum(g_masks.astype(jnp.float32) * weights, axis=-1)
+                    sorted_idx = jnp.argsort(scores)
+                    kept = g_exp[sorted_idx[:n_keep_pg]]
+                    if n_cull_pg > 0:
+                        fill = jax.random.bernoulli(g_fkey, p=0.5, shape=(n_cull_pg, n_vars))
+                        fill = jnp.where(g_fixed, g_bools, fill)
+                        return jnp.concatenate([kept, fill], axis=0)
+                    return kept
 
-            # Handle solutions
+                selected_g = jax.vmap(select_group)(
+                    expanded_g, masks_g,
+                    all_fixed_masks, all_prefix_bools, group_fill_keys,
+                )
+                new_points = selected_g.reshape(batch_size, n_vars)
+
+            else:
+                # ─── No-prefix / single-prefix ──────────────────────────
+                expanded, unsats, unsat_masks = beam_expand(state.points, weights, step_key)
+
+                new_clause_totals = state.clause_totals + unsat_masks.sum(axis=0).astype(jnp.float32)
+
+                best_idx = jnp.argmin(unsats)
+                iter_best = expanded[best_idx]
+                iter_best_unsat = unsats[best_idx]
+                is_better = iter_best_unsat < state.best_unsat
+                new_best_candidate = jnp.where(is_better, iter_best, state.best_candidate)
+                new_best_unsat = jnp.minimum(iter_best_unsat, state.best_unsat)
+
+                new_points = select_and_refill(expanded, unsat_masks, weights, fill_key)
+
+            # ─── Solution handling (shared) ────────────────────────────
             sol_mask = unsats == 0
             n_sols = sol_mask.sum()
 
             if counting:
-                # Stream all solutions to host via callback (use -1 sentinel for invalid)
                 sol_indices = jnp.where(sol_mask, size=n_expanded, fill_value=-1)[0]
-                potential_sols = expanded[jnp.maximum(sol_indices, 0)]  # Safe indexing
-                jax.experimental.io_callback(
+                potential_sols = expanded[jnp.maximum(sol_indices, 0)]
+                io_callback(
                     host_collect_solutions,
                     (),
                     potential_sols,
@@ -342,7 +343,6 @@ def make_gpu_inner_loop(
                 )
                 new_done = jnp.array(False)
             else:
-                # Exit on first solution
                 new_done = n_sols > 0
 
             return BeamState(
@@ -353,7 +353,7 @@ def make_gpu_inner_loop(
                 iter_count=state.iter_count + 1,
                 rng_key=rng_key,
                 done=new_done,
-                prefix_idx=new_prefix_idx,
+                weights=weights,
             )
 
         def cond_fn(state: BeamState) -> Array:
@@ -414,19 +414,25 @@ def run_beam_search(
         print(f"Single prefix: {n_flip} free vars (reduced from {n_vars})")
     elif multi_prefix:
         assert prefixes is not None
-        # Full flip_mask; penalty applied per-point in beam_expand.
-        flip_mask = jnp.eye(n_vars, dtype=bool)
-        n_flip = n_vars
+        # Per-prefix reduced flip masks, padded to max_n_free with zero-rows.
+        # Zero-row XOR produces a duplicate of the original point (harmless waste).
+        all_free_indices = [np.where(prefixes[k] == 0)[0] for k in range(n_prefix)]
+        n_free_per_prefix = [len(fi) for fi in all_free_indices]
+        max_n_free = max(n_free_per_prefix)
+        n_flip = max_n_free
+        eye = np.eye(n_vars, dtype=bool)
+        padded_masks = np.zeros((n_prefix, max_n_free, n_vars), dtype=bool)
+        for k, fi in enumerate(all_free_indices):
+            padded_masks[k, :len(fi)] = eye[fi]
+        flip_mask = jnp.array(padded_masks)  # (n_prefix, max_n_free, n_vars)
         all_fixed_masks = jnp.array(prefixes != 0)   # (n_prefix, n_vars)
-        all_prefix_bools = jnp.array(prefixes < 0)   # (n_prefix, n_vars)
-        print(f"Multi-prefix: {n_prefix} prefix vectors")
+        all_prefix_bools = jnp.array(prefixes < 0)    # (n_prefix, n_vars)
+        waste_pct = 100 * (1 - sum(n_free_per_prefix) / (n_prefix * max_n_free))
+        print(f"Multi-prefix: {n_prefix} vectors, max_n_free={max_n_free}/{n_vars}, padding waste={waste_pct:.1f}%")
     else:
         flip_mask = jnp.eye(n_vars, dtype=bool)
         n_flip = n_vars
     # ─────────────────────────────────────────────────────────────────────
-
-    n_cull = int(batch_size * beta)
-    n_keep = batch_size - n_cull
 
     # Determine inner loop size
     inner_iters = restart_thresh if restart_thresh > 0 else DEFAULT_INNER_ITERS
@@ -453,10 +459,6 @@ def run_beam_search(
         flip_sz = (n_clauses * n_flip + n_flip * n_vars) * jnp.dtype(bool).itemsize
         batch_size = int(np.floor((gpu_mem_target - all_obj_sz) / flip_sz)) * n_devices
         print(f"Batch size: {batch_size} (n_flip={n_flip}, consumed by clauses: {all_obj_sz / (1024*1024):.1f} MB)")
-
-        # Recompute n_cull/n_keep with actual batch_size
-        n_cull = int(batch_size * beta)
-        n_keep = batch_size - n_cull
 
     # Batch alignment: must be divisible by n_devices and n_prefix (if any).
     alignment = math.lcm(max(n_prefix, 1), n_devices)
@@ -495,29 +497,28 @@ def run_beam_search(
     if single_prefix:
         points = jnp.where(fixed_mask_1d, prefix_bools_1d, points)
     elif multi_prefix:
-        # Replicate prefix bools across batch: each prefix gets (batch*top_m)/n_prefix copies
+        # Replicate prefix bools across batch in contiguous groups
         rep = (batch_size * top_m) // n_prefix
         replicated_mask = jnp.repeat(all_fixed_masks, rep, axis=0)
         replicated_bools = jnp.repeat(all_prefix_bools, rep, axis=0)
         points = jnp.where(replicated_mask, replicated_bools, points)
-        # Track which prefix each expanded point belongs to
-        expanded_pidx = jnp.repeat(jnp.arange(n_prefix, dtype=jnp.int32), rep)
 
     if top_m > 1:
-        weighted_scores, _ = verifier(points, weights)
-        top_indices = jnp.argsort(weighted_scores)[:batch_size]
-        points = points[top_indices]
         if multi_prefix:
-            expanded_pidx = expanded_pidx[top_indices]
-    points = jax.device_put(points, batch_sharding)
-
-    # Build initial prefix_idx for multi-prefix tracking through selection
-    if multi_prefix:
-        if top_m > 1:
-            init_prefix_idx = expanded_pidx
+            # Per-group selection to maintain structural prefix grouping
+            ppg_init = (batch_size * top_m) // n_prefix
+            ppg_final = batch_size // n_prefix
+            grouped = points.reshape(n_prefix, ppg_init, n_vars)
+            def _init_select_group(group_pts: Array) -> Array:
+                scores, _ = verifier(group_pts, weights)
+                idx = jnp.argsort(scores)[:ppg_final]
+                return group_pts[idx]
+            points = jax.vmap(_init_select_group)(grouped).reshape(batch_size, n_vars)
         else:
-            init_prefix_idx = jnp.repeat(jnp.arange(n_prefix, dtype=jnp.int32), batch_size // n_prefix)
-        init_prefix_idx = jax.device_put(init_prefix_idx, batch_sharding)
+            weighted_scores, _ = verifier(points, weights)
+            top_indices = jnp.argsort(weighted_scores)[:batch_size]
+            points = points[top_indices]
+    points = jax.device_put(points, batch_sharding)
 
     # Initial state
     state = BeamState(
@@ -528,12 +529,13 @@ def run_beam_search(
         iter_count=jnp.array(0, dtype=jnp.int32),
         rng_key=rng_key,
         done=jnp.array(False),
-        prefix_idx=init_prefix_idx if multi_prefix else jnp.zeros(batch_size, dtype=jnp.int32),
+        weights=weights,
     )
 
     total_iters = 0
     restart_ct = 0
     best_assignment = None
+    best_unsat_host = n_clauses
 
     pbar = tqdm(
         total=timeout,
@@ -544,8 +546,8 @@ def run_beam_search(
     t0 = time()
     last_update = t0
 
-    # Compile inner loop for current weights
-    gpu_loop = make_inner_loop(weights, inner_iters)
+    # Compile inner loop once (weights are dynamic via BeamState)
+    gpu_loop = make_inner_loop(inner_iters)
 
     while (time() - t0 < timeout):
         if max_iters > 0 and total_iters >= max_iters:
@@ -566,8 +568,9 @@ def run_beam_search(
 
         # Track best assignment
         best_unsat_val = int(state.best_unsat)
-        if best_assignment is None or best_unsat_val < int(np.sum(best_assignment is None or True)):
+        if best_unsat_val < best_unsat_host:
             best_assignment = np.array(state.best_candidate)
+            best_unsat_host = best_unsat_val
 
         # Check for early exit (non-counting mode)
         if state.done and not counting:
@@ -584,10 +587,10 @@ def run_beam_search(
         if restart_thresh > 0:
             clause_totals = np.array(state.clause_totals)
             worst = max(clause_totals.max(), 1.0)
-            weights = weight_decay * weights + (1 - weight_decay) * clause_totals / worst
+            old_w = np.array(state.weights)
+            new_w = weight_decay * old_w + (1 - weight_decay) * clause_totals / worst
+            state = state._replace(weights=jnp.array(new_w, dtype=jnp.float32))
             restart_ct += 1
-            # Recompile with new weights
-            gpu_loop = make_inner_loop(weights, inner_iters)
 
         # Progress update
         now = time()
@@ -675,9 +678,10 @@ def main(
     process_time = stamp1 - stamp2
 
     # Process prefixes (includes unit literals from DIMACS parsing).
-    prefixes = None
+    prefixes: np.ndarray | None = None
     if prefix_file or sat_parser.unit_prefix:
         prefixes = sat_parser.process_prefix(prefix_file)
+        assert prefixes is not None
         n_prefix = prefixes.shape[0]
         n_fixed = np.count_nonzero(prefixes[0]) if n_prefix == 1 else [np.count_nonzero(p) for p in prefixes]
         print(f"Prefix: {n_prefix} vector(s), fixed vars: {n_fixed} / {n_var}")

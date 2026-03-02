@@ -324,4 +324,4 @@ class FFSatSolver(abc.ABC):
                     print(out_string)
                     self.warmup_sol = True
 
-            logger.info("Warmup Complete", time() - t0)
+            logger.info(f"Warmup Complete {time() - t0}")

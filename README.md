@@ -245,5 +245,5 @@ Artificial Intelligence, 299, 103559.
 *Massively Parallel Continuous Local Search for Hybrid SAT Solving on GPUs*.
 Proceedings of the AAAI Conference on Artificial Intelligence, 39(11), 11140-11149.
 [![DOI](https://img.shields.io/badge/DOI-10.1609%2Faaai.v39i11.33211-blue?logo=doi)](https://doi.org/10.1609/aaai.v39i11.33211)
-[![arXiv](https://img.shields.io/badge/arXiv-2308.15020-b31b1b)](https://arxiv.org/abs/2308.15020)
+[![arXiv](https://img.shields.io/badge/cs.AI-arXiv:2308.15020-b31b1b?logo=arxiv&logoColor=red)](https://arxiv.org/abs/2308.15020)
 [![GitHub](https://img.shields.io/badge/GitHub-FastFourierSAT-181717?logo=github)](https://github.com/seeder-research/FastFourierSAT)

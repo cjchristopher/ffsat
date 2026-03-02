@@ -646,9 +646,9 @@ def run_solver(
     logger.info(f"X-DESC {accum_time_descent}")
     if all_sols is not None and first_sol is not None:
         logger.info(f"X-SOLS {all_sols_cnt}")
-        logger.info(f"X-UQSOLS {len(all_sols)}")
+        logger.info(f"X-UQSOLS {len(uniq_sols)}")
         if counting == 2:
-            print(len(all_sols), len(uniq_sols))
+            print((uniq_sols))
     else:
         logger.info("X-SOLS 0")
         logger.info("X-UQSOLS 0")
