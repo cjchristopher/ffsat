@@ -250,7 +250,6 @@ def run_solver(
 ) -> float:
     devices = jax.devices("gpu")[:n_devices]
     n_prefix = len(prefix_vectors) if prefix_vectors is not None else 1
-    print(prefix_vectors, n_prefix)
 
     mesh, obj_sharding, batch_sharding = get_mesh(devices)
     jax.sharding.set_mesh(mesh)
@@ -353,7 +352,7 @@ def run_solver(
     timeout_m, timeout_s = divmod(timeout, 60)
 
     if not benchmark:
-        hist_width = min(os.get_terminal_size().columns, solver.maxiter)
+        hist_width = min(os.get_terminal_size().columns if sys.stdin.isatty() else 100, solver.maxiter)
         iters_histo = sparklines({x: 0 for x in range(1, hist_width)}.values(), num_lines=5)  # type: ignore
         histbars = [tqdm(desc=" ", position=x, bar_format="{desc}", leave=True) for x in range(len(iters_histo))]
         infobars = [tqdm(desc=" ", position=x + len(iters_histo), bar_format="{desc}", leave=True) for x in range(2)]
@@ -678,6 +677,8 @@ def main(
     prefix_file: str = "",
     maxiters: int = 100,
 ) -> None:
+    if not file:
+        raise ValueError("No problem file specified")
     stamp1 = time()
     sat_parser = PBSATFormula(workers=4, n_devices=n_devices, disk_cache=disk_cache, file=file)
     stamp2 = time()
@@ -687,7 +688,7 @@ def main(
     n_var = sat_parser.n_var
     n_clause = sat_parser.n_clause
     prefixes = sat_parser.process_prefix(prefix_file)
-    prefixes = jnp.array(prefixes) if prefixes else None
+    prefixes = jnp.array(prefixes) if prefixes is not None else None
     stamp1 = time()
     process_time = stamp1 - stamp2
 
