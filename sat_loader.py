@@ -163,7 +163,7 @@ class PBSATFormula(object):
 
             # Clause extracted. Check for errors in spec, correct generic edge cases.
             if n == 0:
-                logger.warning(f"Line {idx}: Skipping empty clause")
+                logger.debug(f"Line {idx}: Skipping empty clause")
                 return
 
             if n == 1:
@@ -173,11 +173,11 @@ class PBSATFormula(object):
                         raise ValueError
 
                     case "amo":
-                        logger.warning(f"Line {idx}: Skipping length 1 AMO clause (trivially SAT): {line}")
+                        logger.debug(f"Line {idx}: Skipping length 1 AMO clause (trivially SAT): {line}")
                         return
 
                     case "eo" | "cnf":
-                        logger.warning(f"Line {idx}: Prefixing unit literals enoded as EO: {line}")
+                        logger.debug(f"Line {idx}: Prefixing unit literals enoded as EO: {line}")
                         if -lits[0] in self.unit_prefix:
                             logger.error(f"Conflict found among unit literals - {dimacs_file} is UNSAT")
                             raise UnsatError
@@ -194,7 +194,7 @@ class PBSATFormula(object):
                     raise UnsatError
 
                 if card == n:
-                    logger.warning(f"Line {idx}: Prefixing {n} unit literals enoded as CARD/EK-{n}: {line}")
+                    logger.debug(f"Line {idx}: Prefixing {n} unit literals enoded as CARD/EK-{n}: {line}")
                     for lit in lits:
                         if -lit in self.unit_prefix:
                             logger.error(f"Conflict found among unit literals - {dimacs_file} is UNSAT")
@@ -205,10 +205,10 @@ class PBSATFormula(object):
 
                 if card == 0:
                     if clause_type == "card":
-                        logger.warning(f"Line {idx}: Skipping CARD-0 clause (trivially SAT): {line}")
+                        logger.debug(f"Line {idx}: Skipping CARD-0 clause (trivially SAT): {line}")
                         return
                     else:
-                        logger.warning(f"Line {idx}: Prefixing negated EK-0 clause (trivially SAT): {line}")
+                        logger.debug(f"Line {idx}: Prefixing negated EK-0 clause (trivially SAT): {line}")
                         for lit in lits:
                             if lit in self.unit_prefix:
                                 logger.error(f"Conflict found among unit literals - {dimacs_file} is UNSAT")
@@ -218,10 +218,10 @@ class PBSATFormula(object):
 
                 if card == 1:
                     if clause_type == "card":
-                        logger.warning(f"Line {idx}: Adjusting non-trivial CARD-1 clause to CNF: {line}")
+                        logger.debug(f"Line {idx}: Adjusting non-trivial CARD-1 clause to CNF: {line}")
                         clause_type = "cnf"
                     else:
-                        logger.warning(f"Line {idx}: Adjusting non-trivial EK-1 clause to EO: {line}")
+                        logger.debug(f"Line {idx}: Adjusting non-trivial EK-1 clause to EO: {line}")
                         clause_type = "eo"
                     card = 0
 
@@ -239,7 +239,6 @@ class PBSATFormula(object):
 
                     # Problem metadata
                     elif tokens[0] == "p":
-                        print(len(tokens), tokens)
                         if len(tokens) == 4:
                             self.n_var = int(tokens[-2])
                             self.n_clause = int(tokens[-1])

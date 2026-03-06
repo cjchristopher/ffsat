@@ -7,7 +7,7 @@ import math
 import os
 import sys
 from argparse import ArgumentParser as ArgParse
-from collections import Counter
+from collections import Counter, defaultdict
 from contextlib import nullcontext
 from time import perf_counter as time
 
@@ -135,6 +135,9 @@ def x0_guesses(
     elif method == "uniform":
         x0 = jax.random.uniform(rng_key, minval=-1, maxval=1, shape=(batch, n_vars))
 
+    elif method == "trunc":
+        x0 = jax.random.truncated_normal(rng_key, lower=-1, upper=1, shape=(batch, n_vars))
+
     else:
         raise ValueError(f"Unsupported method: {method}")
 
@@ -246,7 +249,9 @@ def run_solver(
     rand_seed: bool = False,
     prefix_vectors: Array | None = None,
     maxiters: int = 100,
-    weight_decay: float = 0.9, #alpha
+    weight_decay: float = 0.9, #alpha,
+    unsat_h: int = 0,
+    solver_tol: float = 1e-3,
 ) -> float:
     devices = jax.devices("gpu")[:n_devices]
     n_prefix = len(prefix_vectors) if prefix_vectors is not None else 1
@@ -262,16 +267,16 @@ def run_solver(
     # Construct pure JAX functions (closures) and build solver.
     obj_eval_fns, obj_verify_fns = build_eval_verify(objs, sol_name == "unbounded")
     seq_evaluator, seq_verifier = seq_eval_verify(obj_eval_fns, obj_verify_fns)
-    solver = FFSatSolver(seq_evaluator, seq_verifier, solver=sol_name, maxiter=maxiters)
+    solver = FFSatSolver(seq_evaluator, seq_verifier, solver=sol_name, maxiter=maxiters, tol=solver_tol)
 
     seed = int(time()) if rand_seed else 0
     logger.debug(f"seed={seed}, rand_seed={rand_seed}")
     key = jax.random.PRNGKey(np.array(seed))
     f_key = jax.random.PRNGKey(np.array(seed + 1))
 
+    guess_batch = 0
     if batch == -1:
         logger.info("Guessing optimal batch size")
-        # User has requested we auto-select optimal batch size.
         # Optimal throughput is achieved when working set fits in GPU L2 cache.
         # Fall back to 1% of VRAM if L2 cache size is unavailable.
         l2_cache_size = get_gpu_l2_cache_size(devices[0])
@@ -295,7 +300,7 @@ def run_solver(
         x_guess = jax.device_put(
             jax.random.uniform(key, minval=0.99 - (5e-2), maxval=0.99, shape=(guess_batch, n_vars)), batch_sharding
         )
-        empty_prefix = jax.device_put(jnp.full((guess_batch, 1), fill_value=False, dtype=bool), batch_sharding)
+        empty_prefix = jax.device_put(jnp.full((guess_batch, n_prefix), fill_value=False, dtype=bool), batch_sharding)
         w_guess = tuple((w - 1e-4) for w in weights)
         peak_mem = solver.peak_memory_estimation(x_guess, empty_prefix, w_guess)
         mem_est_per_point = peak_mem // guess_batch
@@ -334,14 +339,11 @@ def run_solver(
             logger.info(f"W-XT {warm_end - warm_start}")
             return warm_end - warm_start
 
-    all_sols_cnt = 0
-    all_sols = None
-    uniq_sols = set()
+    all_sols: dict[tuple, int] = defaultdict(int)
     best_x = np.zeros((n_vars))
-    ttfs = None
+    ttfs = 0
     best_unsat = jnp.inf
     best_unsat_clauses_idx = np.array([0])
-    first_sol = None
     batches_done = 0
     restart_ct = 0
     restart_batch_unsats = []
@@ -389,7 +391,6 @@ def run_solver(
         _, eval_scores = aux_info
         eval_scores = jnp.array(eval_scores).squeeze().T
 
-        tbatch = time()
         batch_best_loc = jnp.argmin(opt_unsat_ct)
         batch_best_unsat = jnp.take(opt_unsat_ct, batch_best_loc)
         batch_best_x = opt_x0[batch_best_loc]
@@ -399,17 +400,21 @@ def run_solver(
             best_unsat = np.asarray(batch_best_unsat).copy()
             best_unsat_clauses_idx = np.asarray(batch_best_unsat_clauses_idx).copy()
 
+        if unsat_h and batch_best_unsat < unsat_h:
+            ttfs = time() - t0
+            break
+
+        tbatch = time()
         found_sol = False
         if batch_best_unsat == 0:
             best_x = np.asarray(batch_best_x).copy()
             if not counting and not benchmark:
                 print("Found a solution!")
-            if first_sol is None:
+            if ttfs == 0:
                 ttfs = tbatch - t0
-                first_sol = np.asarray(jnp.sign(batch_best_x)).copy()
             found_sol = True
 
-        if fuzz_limit and counting and not found_sol:
+        if fuzz_limit and (counting or not found_sol):
             # Knock current batch in attempt to find more solutions.
             fuzz_attempt = 0
             F_x = opt_x0[:]
@@ -417,6 +422,11 @@ def run_solver(
             fuzz = jax.random.uniform(s_f_key, minval=1e-7, maxval=1e-2, shape=x0.shape)
             fuzz_mag = 1
             while fuzz_attempt < fuzz_limit:
+                fuzz_mask = np.ones(F_x.shape, dtype=bool)
+                if found_sol:
+                    sol_locs = jnp.argwhere(jnp.where(opt_unsat_ct < 1, 1, 0)).flatten().tolist()
+                    fuzz_mask[sol_locs, :] = False  # Do not add fuzz to these rows
+
                 fuzz_attempt += 1
                 if fuzz_mag != 1:
                     fuzz_adj = jnp.sign(fuzz) * jnp.abs(fuzz) ** (1 / fuzz_mag)
@@ -424,7 +434,7 @@ def run_solver(
                     fuzz_adj = fuzz
 
                 # Project back on to hypercube.
-                F_x = jnp.clip(F_x + fuzz_adj, -1, 1)
+                F_x = jnp.clip(jnp.where(fuzz_mask, F_x + fuzz_adj, F_x), -1, 1)
 
                 F_opt_x, F_opt_unsat, F_opt_iters, F_opt_unsat_ct, (_, F_eval_scores) = solver.run(
                     F_x, fixed_vars, weights
@@ -445,10 +455,18 @@ def run_solver(
                     best_unsat_clauses_idx = np.asarray(F_batch_best_unsat_clauses_idx).copy()
                     opt_x0, opt_unsat, opt_iters, opt_unsat_ct = F_x, F_opt_unsat, F_opt_iters, F_opt_unsat_ct
 
+                tfuzz = time()
                 if F_batch_best_unsat == 0:
-                    print(f"Fuzz {fuzz_attempt} found a solution!")
-                    found_sol = True
-                    break
+                    if not found_sol:
+                        if ttfs == 0:
+                            ttfs = tfuzz - t0
+                        found_sol = True
+                        logger.info(f"Fuzz {fuzz_attempt} found a solution!")
+                    elif len(jnp.argwhere(jnp.where(F_opt_unsat_ct < 1, 1, 0)).flatten().tolist()) > len(sol_locs):
+                        logger.debug(f"Fuzz {fuzz_attempt} found more solutions")
+
+                    if not counting:
+                        break
 
                 if (jnp.sign(F_x) == jnp.sign(F_opt_x)).all():
                     # If no points ended up changing signs after convergence, we didn't move at all. Increase magnitude
@@ -461,18 +479,11 @@ def run_solver(
         if found_sol:
             if counting:
                 sol_locs = jnp.argwhere(jnp.where(opt_unsat_ct < 1, 1, 0)).flatten().tolist()
-                all_sols_cnt += len(sol_locs)
-                batch_sols = np.asarray(np.sign(np.asarray(opt_x0[sol_locs, :])))
-                if counting == 2: #unique mode
-                    # Convert to string tuples for efficient set-based deduplication
-                    # batch_sols_tuples = [tuple(row) for row in batch_sols]
-                    uniq_sols.update([tuple(row) for row in batch_sols])
-                if all_sols is not None:
-                    all_sols = np.unique(np.concatenate((all_sols, batch_sols), axis=0), axis=0)
-                else:
-                    all_sols = batch_sols
+                batch_sols = [tuple(row.tolist()) for row in np.sign(np.asarray(opt_x0[sol_locs, :]))]
+                for sol in batch_sols:
+                    all_sols[sol] += 1
 
-            if not counting and not benchmark:
+            elif not benchmark:
                 for x in range(len(histbars)):
                     histbars[x].close()
                 for x in range(len(infobars)):
@@ -516,15 +527,15 @@ def run_solver(
                 + f"median: {int(jnp.median(opt_iters))}"
             )
 
-        restart_batch_unsats.append(np.asarray(opt_unsat))
-        restart_unsats.extend(np.array(opt_unsat_ct.flatten()).tolist())
-        restart_evals.extend(np.array(eval_scores.flatten()).tolist())
-        restart_iters.extend(opt_iters_local)
-        restart_flips.extend(np.array(flips.flatten()).tolist())
         batches_done += 1
         end_batch = time()
 
         if restart_thresh:
+            restart_batch_unsats.append(np.asarray(opt_unsat))
+            restart_unsats.extend(np.array(opt_unsat_ct.flatten()).tolist())
+            restart_evals.extend(np.array(eval_scores.flatten()).tolist())
+            restart_iters.extend(opt_iters_local)
+            restart_flips.extend(np.array(flips.flatten()).tolist())
             # TODO: There is probably some way to calculate how many restarts are needed given the batch size to get
             # enough of a sample to ensure the reweighting is meaningful. If there's 500 clauses and we are only running
             # batches of 100, we probably need restart_thresh to be more than 1, at the very least. I think? I don't
@@ -564,7 +575,7 @@ def run_solver(
                 restart_flips = []
                 restart_ct += 1
 
-        if pbar:
+        if not benchmark:
             pbstr = f"{batches_done % restart_thresh}/{restart_thresh}" if restart_thresh else f"{batches_done} batches"
             pbelapse = pbar.format_dict["elapsed"]
             pbn = pbar.format_dict["n"]
@@ -586,79 +597,76 @@ def run_solver(
                 infobars[x].close()
         pbar.close()
 
-    p_sol = 0
-    all_sols = [first_sol] if (all_sols is None and first_sol is not None) else all_sols
-    if all_sols is not None:
-        for sol_i, sol in enumerate(all_sols):
-            out_string = "v"
-            for i in range(n_vars):
-                lit = i + 1
-                if sol[i] > 0:
-                    out_string += f" {-lit}"
-                else:
-                    out_string += f" {lit}"
-            logger.info(f"{sol_i+1}: {out_string}")
-            p_sol += 1
+    if len(all_sols):
+        for sol_i, sol in enumerate(all_sols.keys()):
+            sol_string = "v"
+            for var, assigned in enumerate(np.sign(sol)):
+                lit = (var + 1) * assigned
+                sol_string += f" {-lit}"
+            logger.info(f"{sol_i+1}: {sol_string}")
             if benchmark:
+                # just print one when benchmarking
                 break
     else:
-        print("Best assignment found:")
-        out_string = "v"
+        assign_str = "v"
         assignment = []
-        for i in range(n_vars):
-            lit = i + 1 # correct for 0 indexing.
-            if best_x[i] > 0:
-                out_string += f" {-lit}"
-                assignment.append(-lit)
-            else:
-                out_string += f" {lit}"
-                assignment.append(lit)
-        print(out_string)
+        pr_signs = ["?", "-", ""]
+        for var, assigned in enumerate(np.sign(best_x)):
+            lit = var + 1
+            assign_str += f" {pr_signs[int(assigned)]}{lit}"
+            if assigned:
+                assignment.append(lit * -assigned)
+
+        logger.info(f"Best assignment found (0 energy output as ?lit) [{best_unsat} UNSAT]:")
+        logger.info(f"{assign_str}")
+
         assignment = set(assignment)
-        for i, cl_idx in enumerate(best_unsat_clauses_idx.flatten()):
-            find_idx = cl_idx
-            for obj in objs:
-                obj_len = obj.clauses.lits.shape[0]
-                if find_idx < obj_len:
-                    if len(obj.clauses.sign.shape) > 1:
-                        clause = set(((obj.clauses.lits[find_idx] + 1) * obj.clauses.sign[find_idx]).tolist())
+        if logger.level <= logging.DEBUG:
+            logger.debug(f"UNSATS (set literals-clause literals):\n")
+            for i, cl_idx in enumerate(best_unsat_clauses_idx.flatten()):
+                find_idx = cl_idx
+                for obj in objs:
+                    obj_len = obj.clauses.lits.shape[0]
+                    if find_idx < obj_len:
+                        if len(obj.clauses.sign.shape) > 1:
+                            clause = set(((obj.clauses.lits[find_idx] + 1) * obj.clauses.sign[find_idx]).tolist())
+                        else:
+                            clause = set(((obj.clauses.lits[find_idx] + 1) * obj.clauses.sign).tolist())
+                        logger.debug(f"{(sorted(clause.intersection(assignment)), clause)}")
+                        break
                     else:
-                        clause = set(((obj.clauses.lits[find_idx] + 1) * obj.clauses.sign).tolist())
-                    print(sorted(clause.intersection(assignment)), clause)
-                    break
-                else:
-                    find_idx -= obj_len
-    for i, w in enumerate(weights):
-        logger.debug(f"{set((np.array(objs[i].clauses.types)).flatten().tolist())}  {objs[i].clauses.lits.shape} {w} \n")
-    if ttfs:
-        logger.info(f"X-TTFS {ttfs}")
-    logger.info("START EXP")
-    logger.info(f"X-GPU {n_devices}")
-    logger.info(f"X-PPBATCH {batch}")
-    logger.info(f"X-PPGPUBATCH {batch // n_devices} PPBATCH/GPU")
-    if warmup:
-        logger.info(f"X-PEAK {peak_mem}")
-        logger.info(f"X-PEAKPP {mem_est_per_point} PEAK/PPBATCH")
-    logger.info(f"X-BATCHES {batches_done}")
-    logger.info(f"X-PTOTAL {batches_done * batch} BATCHES*PPBATCH")
-    logger.info(f"X-LOOP {tsolve}")
-    logger.info(f"X-DESC {accum_time_descent}")
-    if all_sols is not None and first_sol is not None:
-        logger.info(f"X-SOLS {all_sols_cnt}")
-        logger.info(f"X-UQSOLS {len(uniq_sols)}")
-        if counting == 2:
-            print((uniq_sols))
-    else:
-        logger.info("X-SOLS 0")
-        logger.info("X-UQSOLS 0")
-    logger.info(f"X-RATIODESC {(batches_done * batch) / accum_time_descent} POINTS/DESCTIME")
-    logger.info(f"X-RATIOLOOP {(batches_done * batch) / tsolve} POINTS/LOOPTIME")
-    logger.info(f"X-ITERHISTO {dict(Counter(restart_iters))}")
-    logger.info(f"X-RAWEVAL {restart_evals}")
-    logger.info(f"X-RAWUNSAT {restart_unsats}")
-    logger.info(f"X-RAWITER {restart_iters}")
-    logger.info(f"X-RAWFLIPS {restart_flips}")
-    logger.info("END EXP")
+                        find_idx -= obj_len
+            for i, w in enumerate(weights):
+                logger.debug(f"\t{set((np.array(objs[i].clauses.types)).flatten().tolist())},{objs[i].clauses.lits.shape} \n{w}")
+
+    if logger.level <= logging.INFO:
+        if ttfs:
+            logger.info(f"X-TTFS {ttfs}")
+        logger.info("START EXP")
+        logger.info(f"X-GPU {n_devices}")
+        logger.info(f"X-PPBATCH {batch}")
+        logger.info(f"X-PPGPUBATCH {batch // n_devices} PPBATCH/GPU")
+        if warmup:
+            logger.info(f"X-PEAK {peak_mem}")
+            logger.info(f"X-PEAKPP {mem_est_per_point} PEAK/PPBATCH")
+        logger.info(f"X-BATCHES {batches_done}")
+        logger.info(f"X-PTOTAL {batches_done * batch} BATCHES*PPBATCH")
+        logger.info(f"X-LOOP {tsolve}")
+        logger.info(f"X-DESC {accum_time_descent}")
+        if len(all_sols):
+            logger.info(f"X-SOLS {sum(all_sols.values())}")
+            logger.info(f"X-UQSOLS {len(all_sols.keys())}")
+        else:
+            logger.info("X-SOLS 0")
+            logger.info("X-UQSOLS 0")
+        logger.info(f"X-RATIODESC {(batches_done * batch) / accum_time_descent} POINTS/DESCTIME")
+        logger.info(f"X-RATIOLOOP {(batches_done * batch) / tsolve} POINTS/LOOPTIME")
+        logger.info(f"X-ITERHISTO {dict(Counter(restart_iters))}")
+        logger.info(f"X-RAWEVAL {restart_evals}")
+        logger.info(f"X-RAWUNSAT {restart_unsats}")
+        logger.info(f"X-RAWITER {restart_iters}")
+        logger.info(f"X-RAWFLIPS {restart_flips}")
+        logger.info("END EXP")
     return tsolve
 
 
@@ -676,6 +684,9 @@ def main(
     rand_seed: bool = False,
     prefix_file: str = "",
     maxiters: int = 100,
+    unsat_h: float = 0,
+    sample_method: str = "bias",
+    solver_tol: float = 1e-3
 ) -> None:
     if not file:
         raise ValueError("No problem file specified")
@@ -707,6 +718,9 @@ def main(
         warmup=warmup,
         prefix_vectors=prefixes,
         maxiters=maxiters,
+        unsat_h=int(unsat_h * 2 * n_var) if unsat_h else 0,
+        sample_method=sample_method,
+        solver_tol=solver_tol
     )
 
     logger.info(f"Time reading input: {read_time}")
@@ -739,6 +753,9 @@ if __name__ == "__main__":
     ap.add_argument("-s", "--rand_seed", action="store_true", help="Randomise seed")
     ap.add_argument("-p", "--prefix", type=str, default="", help="Fixed assignments file, each a line of assigned vars")
     ap.add_argument("-i", "--iters_desc", type=int, default=100, help="Solver maximum iterations")
+    ap.add_argument("-u", "--unsat_thresh", type=float, default=0, help="Stop when #UNSAT drops below threshold (PLE)")
+    ap.add_argument("-m", "--sample_meth", type=str, default="bias", help="Starting point sampler (bias,coin,uniform)")
+    ap.add_argument("-q", "--solver_tol", type=float, default=1e-3, help="Solver convergence tolerance (if supported)")
 
     arg = ap.parse_args()
     logger.info(f"{arg._get_args()}")
@@ -770,6 +787,9 @@ if __name__ == "__main__":
             rand_seed=arg.rand_seed,
             prefix_file=arg.prefix,
             maxiters=arg.iters_desc,
+            unsat_h=arg.unsat_thresh,
+            sample_method=arg.sample_meth,
+            solver_tol=arg.solver_tol
         )
         if arg.profile:
             jax.profiler.save_device_memory_profile("memory.prof")

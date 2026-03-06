@@ -26,25 +26,25 @@ Optionally, see https://github.com/NVIDIA/JAX-Toolbox for Docker images that may
 ### Setup
 
 1. Clone the repository:
-   ```bash
-   git clone https://github.com/cjchristopher/ffsat.git
-   cd ffsat
-   ```
+```bash
+    git clone https://github.com/cjchristopher/ffsat.git
+    cd ffsat
+```
 
 2. Create and activate a virtual environment (recommended, your choice of environment management, venv here for illustration):
-   ```bash
-   python -m venv venv
-   source venv/bin/activate  # On Windows: venv\Scripts\activate
-   ```
+```bash
+    python -m venv venv
+    source venv/bin/activate  # On Windows: venv\Scripts\activate
+```
 
-3. Install JAX
+3. Install JAX and dependencies
+```bash
+    pip install jax[cuda12]==0.8.0 tqdm sparklines jaxopt
+```
 
-   See [JAX Installation](https://docs.jax.dev/en/latest/installation.html#installation) for instructions.
-
-4. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
+   See [JAX Installation](https://docs.jax.dev/en/latest/installation.html#installation) for additional instructions,
+   e.g. if you have different versions of cuda, or non Nvidia GPUs (note, only tested on CPU and Nvidia GPUs/CUDA).
+   Presently all version of JAX>=0.8.1 have a breaking bug which has been reported.
 
 ## Dependencies
 
@@ -61,7 +61,7 @@ Core dependencies (see `requirements.txt` for complete list with versions):
 
 All dependencies can be installed via:
 ```bash
-pip install -r requirements.txt
+    pip install -r requirements.txt
 ```
 
 ## Input Format
@@ -158,37 +158,37 @@ python ffsat.py [options] input_file.cnf
 
 Basic usage:
 ```bash
-python ffsat.py problem.cnf
+    python ffsat.py problem.cnf
 ```
 
 Running with a 10-minute timeout and specific batch size:
 ```bash
-python ffsat.py problem.cnf -t 600 -b 32
+    python ffsat.py problem.cnf -t 600 -b 32
 ```
 
 Enable five fuzzing passes per batch:
 ```bash
-python ffsat.py problem.cnf -f 5
+    python ffsat.py problem.cnf -f 5
 ```
 
 Run with debugging enabled and profiling:
 ```bash
-python ffsat.py problem.cnf -d DEBUG -p
+    python ffsat.py problem.cnf -d DEBUG -p
 ```
 
 Use a prefix file with fixed variable assignments:
 ```bash
-python ffsat.py problem.cnf -p prefix.txt
+    python ffsat.py problem.cnf -p prefix.txt
 ```
 
 Use specific number of GPUs with custom iteration depth:
 ```bash
-python ffsat.py problem.cnf -n 2 -i 200
+    python ffsat.py problem.cnf -n 2 -i 200
 ```
 
 Counting mode - find all solutions within 5 minutes:
 ```bash
-python ffsat.py problem.cnf -t 300 -c 1
+    python ffsat.py problem.cnf -t 300 -c 1
 ```
 
 ## Output

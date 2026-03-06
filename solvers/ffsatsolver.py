@@ -94,21 +94,37 @@ def build_eval_verify(objs: tuple[Objective, ...], unbounded: bool) -> tuple[tup
             "ek": lambda x: jnp.sum(x < 0, axis=1, where=mask) != cards,
         }
 
+        def evaluate_xor(x: Array, fixed_vars: Array, weight: Array) -> Array:
+            x = jnp.where(fixed_vars, jax.lax.stop_gradient(x), x)
+            assignment = sign * x[lits]                                           # (N,K) * (N,K) = (N,K)
+            clause_eval = jnp.prod(assignment, axis=-1)                          # (N,)
+            weighted_eval = weight * clause_eval                                  # (N,) * (N,) = (N,)
+            x_eval = jnp.sum(weighted_eval, axis=-1)                              # (1,)
+            if not unbounded:
+                return jnp.atleast_1d(x_eval)
+            else:
+            # Affine shift to [0,1]-cube and add error term for unbounded optimisation.
+                return ((jnp.atleast_1d(x_eval)+1)/2)**2 + (x**2 - 1)**(lits.shape[-1])
+
         def evaluate(x: Array, fixed_vars: Array, weight: Array) -> Array:
             #TODO: Create an eval_rules dict (like above unsat_rules) that only applies the full transform
             # for clause types that need it. e.g. XOR can be shortcut substantially if we close over the types.
 
             #TODO: Re-inline this function at some point. I'm no longer convinced jax.checkpoint helps us here.
             #@jax.checkpoint
-            def fourier_checkpoint(x: Array) -> Array:
-                assignment = sign * x[lits]                                       # (N,K) * (N,K) = (N,K)
-                # Add dimension to capture K+1 shifted roots for K terms of the clause.
-                fourier_domain = dft + assignment[:, None, :]                     # (N,(K+1),1) + (N,_,K) = (N,(K+1),K)
-                esp_freq = jnp.prod(fourier_domain, axis=-1, where=forward_mask)
-                return esp_freq                                                   # (N,(K+1))
+            # def fourier_checkpoint(x: Array) -> Array:
+            #     assignment = sign * x[lits]                                       # (N,K) * (N,K) = (N,K)
+            #     # Add dimension to capture K+1 shifted roots for K terms of the clause.
+            #     fourier_domain = dft + assignment[:, None, :]                     # (N,(K+1),1) + (N,_,K) = (N,(K+1),K)
+            #     esp_freq = jnp.prod(fourier_domain, axis=-1, where=forward_mask)
+            #     return esp_freq                                                   # (N,(K+1))
 
             x = jnp.where(fixed_vars, jax.lax.stop_gradient(x), x)
-            esp_freq = fourier_checkpoint(x)                                      # (N,(K+1))
+            assignment = sign * x[lits]                                           # (N,K) * (N,K) = (N,K)
+            # Add dimension to capture K+1 shifted roots for K terms of the clause.
+            fourier_domain = dft + assignment[:, None, :]                         # (N,(K+1),1) + (N,_,K) = (N,(K+1),K)
+            esp_freq = jnp.prod(fourier_domain, axis=-1, where=forward_mask)
+            # esp_freq = fourier_checkpoint(x)                                      # (N,(K+1))
             esp_eval = idft * esp_freq                                            # (1,(K+1)) * (N,(K+1)) = (N,(K+1))
             clause_eval = jnp.sum(esp_eval.real, axis=-1)                         # (N,)
             weighted_eval = weight * clause_eval                                  # (N,) * (N,) = (N,)
@@ -131,7 +147,10 @@ def build_eval_verify(objs: tuple[Objective, ...], unbounded: bool) -> tuple[tup
 
             return unsat
 
-        return evaluate, verify
+        eval_f = evaluate
+        if len(obj.clauses.types.flatten()) == 1 and obj.clauses.types.flatten()[0] == clause_type_ids["xor"]:
+            eval_f = evaluate_xor
+        return eval_f, verify
 
     eval_fns: tuple[EvalFn]
     verify_fns: tuple[VerifyFn]
@@ -164,6 +183,7 @@ class FFSatSolver(abc.ABC):
         verifier: VerifyFn,
         solver: str = "lbfgsb",
         maxiter: int = 100,
+        tol: float = 1e-3
     ) -> None:
         self.sol_name = solver
         self.maxiter = maxiter
@@ -216,7 +236,7 @@ class FFSatSolver(abc.ABC):
                     return x_opt, unsat, jnp.atleast_1d(state.iter_num), state.fun_val
 
             elif self.sol_name in ["pgd"]:
-                pgd = ProjectedGradient(fun=evaluator, projection=box, maxiter=self.maxiter, has_aux=True)
+                pgd = ProjectedGradient(fun=evaluator, projection=box, maxiter=self.maxiter, has_aux=True, tol=tol)
                 logger.info("Setting up JAXOPT Projected Gradient (Box)")
 
                 def opt(x: Array, fixed_vars: Array, weights: tuple[Array, ...]) -> tuple[Array, Array, Array, Array]:
