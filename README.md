@@ -46,24 +46,6 @@ Optionally, see https://github.com/NVIDIA/JAX-Toolbox for Docker images that may
    e.g. if you have different versions of cuda, or non Nvidia GPUs (note, only tested on CPU and Nvidia GPUs/CUDA).
    Presently all version of JAX>=0.8.1 have a breaking bug which has been reported.
 
-## Dependencies
-
-Core dependencies (see `requirements.txt` for complete list with versions):
-
-- JAX (0.6.0) and JAX CUDA plugins
-- jaxopt (0.8.5) - Optimization library
-- NumPy (2.2.5)
-- SciPy (1.15.2)
-- tqdm (4.67.1) - Progress bars
-- python-sat (1.8.dev16) - SAT utilities
-- Rich (14.0.0) - Terminal formatting
-- NVIDIA CUDA libraries (CUDA 12.x compatible)
-
-All dependencies can be installed via:
-```bash
-    pip install -r requirements.txt
-```
-
 ## Input Format
 
 The solver accepts files in standard DIMACS CNF format as well as an extended hybrid format that supports various constraint types.
