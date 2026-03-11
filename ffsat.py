@@ -25,7 +25,7 @@ os.environ["XLA_FLAGS"] = " ".join(
         "--xla_gpu_autotune_gemm_rtol=1e-6",
         "--xla_gpu_exhaustive_tiling_search=true",
         # "--xla_gpu_deterministic_ops=true",
-        "--xla_gpu_require_complete_aot_autotune_results=true",
+        # "--xla_gpu_require_complete_aot_autotune_results=true",
     ]
 )
 # Single-host, multi-device computation on NVIDIA GPUs
@@ -203,15 +203,17 @@ def get_mesh(devices: list) -> tuple[Mesh, NamedSharding, NamedSharding]:
     return mesh, obj_sharding, batch_sharding
 
 
-def adjust_batch(devices: list, batch: int, est_mem_per_point: int, n_prefix: int = 1) -> int:
+def adjust_batch(devices: list, batch: int, target: int, est_mem_per_point: int, n_prefix: int = 1) -> int:
     n_device = len(devices)
-    max_gpu_mem = devices[0].memory_stats()["bytes_limit"]
-    max_batch = int((max_gpu_mem * 0.9) // est_mem_per_point)
-    opt_batch = int((max_gpu_mem * 0.01) // est_mem_per_point)
+    # max_gpu_mem = devices[0].memory_stats()["bytes_limit"]
+    # max_batch = int((max_gpu_mem * 0.9) // est_mem_per_point)
+    # opt_batch = int((max_gpu_mem * 0.01) // est_mem_per_point)
+    max_batch = int((target) // est_mem_per_point)
+    opt_batch = int((target * 0.9) // est_mem_per_point)
 
     if batch == -1 or batch > max_batch:
-        print("Adjusting per-device batch size (either none specified to batch too large):")
-        print(f"Set to {opt_batch} p.d. (tot. {opt_batch * n_device}) from {batch} (theoretical max {max_batch})")
+        logger.info("Adjusting per-device batch size (either none specified to batch too large):")
+        logger.info(f"Set to {opt_batch} p.d. (tot. {opt_batch * n_device}) from {batch} (theoretical max {max_batch})")
         batch = opt_batch * n_device
     else:
         batch = batch * n_device
@@ -282,7 +284,7 @@ def run_solver(
         l2_cache_size = get_gpu_l2_cache_size(devices[0])
         if l2_cache_size is not None:
             # Target ~80% of L2 cache to leave room for other data
-            gpu_mem_target = int(l2_cache_size * 0.95) * n_devices
+            gpu_mem_target = int(l2_cache_size * 0.95) * n_devices * 2
             logger.info(f"Targeting L2 cache: {l2_cache_size / (1024*1024):.1f} MB per GPU")
 
         else:
@@ -307,8 +309,9 @@ def run_solver(
         logger.info(f"Initial batch size guess mem/point: {mem_est_per_point}")
     else:
         mem_est_per_point = 1
+        gpu_mem_target = devices[0].memory_stats()["bytes_limit"]
 
-    batch = adjust_batch(devices, batch, mem_est_per_point, n_prefix)
+    batch = adjust_batch(devices, batch, gpu_mem_target, mem_est_per_point, n_prefix)
 
     if warmup:
         if guess_batch != batch:
@@ -318,12 +321,12 @@ def run_solver(
             )
             empty_prefix = jax.device_put(jnp.full((batch, 1), fill_value=False, dtype=bool), batch_sharding)
 
-        if not benchmark:
+        if not benchmark and logger.level <= logging.DEBUG:
             if mesh.shape["batch"] > 1:
-                print("Batch sharding:")
+                logger.info("Batch sharding:")
                 jax.debug.visualize_array_sharding(x_guess)
             if mesh.shape["objective"] > 1:
-                print("Objective sharding:")
+                logger.info("Objective sharding:")
                 jax.debug.visualize_array_sharding(objs[0].clauses.lits)
 
         peak_mem = solver.peak_memory_estimation(x_guess, empty_prefix, weights)
@@ -340,6 +343,7 @@ def run_solver(
             return warm_end - warm_start
 
     all_sols: dict[tuple, int] = defaultdict(int)
+    first_sol: tuple | None = None
     best_x = np.zeros((n_vars))
     ttfs = 0
     best_unsat = jnp.inf
@@ -400,16 +404,18 @@ def run_solver(
             best_unsat = np.asarray(batch_best_unsat).copy()
             best_unsat_clauses_idx = np.asarray(batch_best_unsat_clauses_idx).copy()
 
-        if unsat_h and batch_best_unsat < unsat_h:
+        if unsat_h and batch_best_unsat <= unsat_h:
             ttfs = time() - t0
+            found_sol = True
             break
 
         tbatch = time()
         found_sol = False
+
         if batch_best_unsat == 0:
             best_x = np.asarray(batch_best_x).copy()
-            if not counting and not benchmark:
-                print("Found a solution!")
+            # if not counting and not benchmark:
+            #     print("Found a solution!")
             if ttfs == 0:
                 ttfs = tbatch - t0
             found_sol = True
@@ -477,13 +483,14 @@ def run_solver(
                 F_x = F_opt_x
 
         if found_sol:
-            if counting:
-                sol_locs = jnp.argwhere(jnp.where(opt_unsat_ct < 1, 1, 0)).flatten().tolist()
-                batch_sols = [tuple(row.tolist()) for row in np.sign(np.asarray(opt_x0[sol_locs, :]))]
-                for sol in batch_sols:
-                    all_sols[sol] += 1
-
-            elif not benchmark:
+            first_sol = tuple(np.sign(best_x).astype(int).tolist())
+            if not counting:
+                break
+            sol_locs = jnp.argwhere(jnp.where(opt_unsat_ct < 1, 1, 0)).flatten().tolist()
+            batch_sols = [tuple(row.astype(int).tolist()) for row in np.sign(np.asarray(opt_x0[sol_locs, :]))]
+            for sol in batch_sols:
+                all_sols[sol] += 1
+            if not benchmark:
                 for x in range(len(histbars)):
                     histbars[x].close()
                 for x in range(len(infobars)):
@@ -600,18 +607,19 @@ def run_solver(
     if len(all_sols):
         for sol_i, sol in enumerate(all_sols.keys()):
             sol_string = "v"
-            for var, assigned in enumerate(np.sign(sol)):
+            for var, assigned in enumerate(np.sign(sol).astype(int)):
                 lit = (var + 1) * assigned
                 sol_string += f" {-lit}"
-            logger.info(f"{sol_i+1}: {sol_string}")
-            if benchmark:
-                # just print one when benchmarking
+            if counting:
+                logger.info(f"{sol_i+1}: {sol_string}")
+            elif first_sol == sol:
+                print(sol_string)
                 break
     else:
         assign_str = "v"
         assignment = []
         pr_signs = ["?", "-", ""]
-        for var, assigned in enumerate(np.sign(best_x)):
+        for var, assigned in enumerate(np.sign(best_x).astype(int)):
             lit = var + 1
             assign_str += f" {pr_signs[int(assigned)]}{lit}"
             if assigned:
@@ -756,6 +764,7 @@ if __name__ == "__main__":
     ap.add_argument("-u", "--unsat_thresh", type=float, default=0, help="Stop when #UNSAT drops below threshold (PLE)")
     ap.add_argument("-m", "--sample_meth", type=str, default="bias", help="Starting point sampler (bias,coin,uniform)")
     ap.add_argument("-q", "--solver_tol", type=float, default=1e-3, help="Solver convergence tolerance (if supported)")
+    ap.add_argument("--stdout_log", action="store_true", help="Send log output to stdout instead of stderr")
 
     arg = ap.parse_args()
     logger.info(f"{arg._get_args()}")
@@ -767,7 +776,7 @@ if __name__ == "__main__":
         level=getattr(logging, arg.debug.upper()),
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
         handlers=[
-            logging.StreamHandler(sys.stderr),
+            logging.StreamHandler(sys.stdout if arg.stdout_log else sys.stderr),
             # Optional: logging.FileHandler('sat_loader.log')  # Also log to file
         ],
     )
