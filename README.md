@@ -1,37 +1,33 @@
-# FFSAT: Fast (GPU Accelerated) Fourier-SAT Solver
+# Accelerated Fourier SAT (AFSAT): Fast (GPU Accelerated) Fourier-SAT Solver
 
-FFSAT is a native pseudo-Boolean (PB) Continuous Local Search (CLS) Satisfiability (SAT) solver that leverages recent developments in closed-form transformations of various pseudo-Boolean constraint types into continuous multilinear polynomial on a one-to-one basis.
+AFSAT is a native pseudo-Boolean (PB) Continuous Local Search (CLS) Satisfiability (SAT) solver that leverages recent developments in closed-form transformations of various pseudo-Boolean constraint types into continuous multilinear polynomial on a one-to-one basis.
 
 The approach takes advantage of the JAX ecosystem, a modern high performance scientific computing framework, leveraging automatic differentiation and efficient optimization for fast distributed GPU kernels.
 
 This work is based on recent theoretical advances by Kyrillidis *et al*[^1] and a proof-of-concept demonstration by Cen *et al*[^2]. The code presented here is an implementation from scratch, and supports arbitrary PB-SAT problems that can be expressed in any combination of the constraint types enumerated below.
 
-A note on naming convention: This does not use *fast Fourier* algorithm. The underlying transform is a *Fourier* transform, hence *Fourier SAT*.
-After this transform, this solver utilises a second discrete Fourier transform for fast polynomial evaluation on GPU, from which the *fast* is derived.
+A note on naming convention: Neither this code, nor the proof-of-concept work, uses a *fast Fourier* algorithm. The underlying transform is a *Fourier* transform, hence *Fourier SAT*.
+After this transform, this solver utilises a second discrete Fourier transform for fast polynomial evaluation on GPU, from which the *fast* is derived. 
+We engineer this idea into a fully featured solver for GPU accelerators, hence *Accelerated*.
 
 ## Installation
 
 ### Prerequisites
 
-- Python >=3.10+ (TBD: Backward compatability to 3.8)
-- For JAX acceleration with NVIDIA:
-  - CUDA >=12.1
-  - CUDNN >=9.1, <10.0
-  - NCCL >=2.18
-  - NVIDIA Driver >=525.60.13
-- See [JAX Installation](https://docs.jax.dev/en/latest/installation.html#installation) for more details, or CPU/TPU requirements (untested).
-
+- Python >=3.10+
+- For JAX acceleration, a compatible GPU or TPU.
+  
 Optionally, see https://github.com/NVIDIA/JAX-Toolbox for Docker images that may work.
 
 ### Setup
 
 1. Clone the repository:
 ```bash
-    git clone https://github.com/cjchristopher/ffsat.git
-    cd ffsat
+    git clone https://github.com/cjchristopher/accelerated-fourier-sat.git
+    cd accelerated-fourier-sat
 ```
 
-2. Create and activate a virtual environment (recommended, your choice of environment management, venv here for illustration):
+2. Create and activate a virtual environment (recommended, your choice of environment management, we use venv here for illustration):
 ```bash
     python -m venv venv
     source venv/bin/activate  # On Windows: venv\Scripts\activate
@@ -39,12 +35,13 @@ Optionally, see https://github.com/NVIDIA/JAX-Toolbox for Docker images that may
 
 3. Install JAX and dependencies
 ```bash
-    pip install jax[cuda12]==0.8.0 tqdm sparklines jaxopt
+    pip install jax[cudaXX] tqdm sparklines jaxopt
 ```
-
-   See [JAX Installation](https://docs.jax.dev/en/latest/installation.html#installation) for additional instructions,
-   e.g. if you have different versions of cuda, or non Nvidia GPUs (note, only tested on CPU and Nvidia GPUs/CUDA).
-   Presently all version of JAX>=0.8.1 have a breaking bug which has been reported.
+   N.B. CUDA 12 is no longer receiving feature updates and future versions of JAX will not support it. 
+   Nvidia deprecated support for many older architectures with the release of CUDA 13, and so an older version of JAX/CUDA may be required for your architecture.
+   See [JAX Installation](https://docs.jax.dev/en/latest/installation.html#installation) for additional instructions.
+   We leave the details of the JAX/CUDA installation to the user, and cannot guarantee compatability,
+   e.g. if you have different versions of CUDA, or non Nvidia GPUs (note, only tested on CPU and Nvidia GPUs/CUDA).
 
 ## Input Format
 
@@ -117,7 +114,7 @@ The parser is flexible with shorthand notations for constraint types, allowing f
 Run the solver with:
 
 ```bash
-python ffsat.py [options] input_file.cnf
+python afsat.py [options] input_file.cnf
 ```
 
 ### Command Line Options
@@ -135,42 +132,48 @@ python ffsat.py [options] input_file.cnf
 - `-s, --rand_seed`: Randomize the random seed (default: uses fixed seed for reproducibility)
 - `-p, --prefix FILE`: Path to file containing fixed variable assignments (one assignment per line, using SAT solver output format with negated literals)
 - `-y, --profile`: Enable profiling (saves JAX trace to `/tmp/jax-trace` and device memory profile to `memory.prof`)
+- `-u, --unsat_thresh FLOAT`: Implemented to replicate a benchmark in `FastFourierSAT` - treats a problem as solved when at least `(1-unsat-thresh)*#clauses` clauses are `True`
+- `-m, --sample_meth STR`: New candidate assignments can be randomly sampled in various ways. Default is `bias`, options are `bias, coin, uniform, trunc`. Documentation TBD.
+- `-q, --solver_tol FLOAT`: For convergence criteria solvers (e.g. gradient descent), overrides the default threshold for which convergence is deemed to have been met.
+- `--stdout_log`: Sends output from logger (e.g. when `--debug` is set) to stdout instead of stderr.
 
 ### Examples
 
 Basic usage:
 ```bash
-    python ffsat.py problem.cnf
+    python afsat.py problem.cnf
+    # OR
+    python afsat.py problem.hybrid
 ```
 
 Running with a 10-minute timeout and specific batch size:
 ```bash
-    python ffsat.py problem.cnf -t 600 -b 32
+    python afsat.py problem.cnf -t 600 -b 32
 ```
 
 Enable five fuzzing passes per batch:
 ```bash
-    python ffsat.py problem.cnf -f 5
+    python afsat.py problem.cnf -f 5
 ```
 
 Run with debugging enabled and profiling:
 ```bash
-    python ffsat.py problem.cnf -d DEBUG -p
+    python afsat.py problem.cnf -d DEBUG -p
 ```
 
 Use a prefix file with fixed variable assignments:
 ```bash
-    python ffsat.py problem.cnf -p prefix.txt
+    python afsat.py problem.cnf -p prefix.txt
 ```
 
 Use specific number of GPUs with custom iteration depth:
 ```bash
-    python ffsat.py problem.cnf -n 2 -i 200
+    python afsat.py problem.cnf -n 2 -i 200
 ```
 
 Counting mode - find all solutions within 5 minutes:
 ```bash
-    python ffsat.py problem.cnf -t 300 -c 1
+    python afsat.py problem.cnf -t 300 -c 1
 ```
 
 ## Output
@@ -187,7 +190,7 @@ The solver uses JAX for hardware acceleration and automatic differentiation. It 
 
 ### Solver Algorithms
 
-FFSAT supports multiple optimization backends (default: `pgd`):
+AFSAT supports multiple optimization backends (default: `pgd`):
 
 - **pgd**: Projected Gradient Descent with box constraints (JAXOPT)
 - **lbfgsb**: Limited-memory BFGS with bounds (JAXOPT)
