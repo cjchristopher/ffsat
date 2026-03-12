@@ -358,16 +358,18 @@ def run_solver(
     timeout_m, timeout_s = divmod(timeout, 60)
 
     if not benchmark:
+        sparkline_height = 5
         hist_width = min(os.get_terminal_size().columns if sys.stdin.isatty() else 100, solver.maxiter)
-        iters_histo = sparklines({x: 0 for x in range(1, hist_width)}.values(), num_lines=5)  # type: ignore
+        iters_histo = sparklines({x: 0 for x in range(1, hist_width)}.values(), num_lines=sparkline_height)  # type: ignore
         histbars = [tqdm(desc=" ", position=x, bar_format="{desc}", leave=True) for x in range(len(iters_histo))]
         infobars = [tqdm(desc=" ", position=x + len(iters_histo), bar_format="{desc}", leave=True) for x in range(2)]
         pbstr = f"{batches_done % restart_thresh}/{restart_thresh}" if restart_thresh else f"{batches_done} batches"
+        newlines = '\n' * sparkline_height
         pbar = tqdm(
             total=timeout,
             leave=True,
             position=len(infobars) + len(histbars),
-            desc=f"{'\n' * 5}restart {restart_ct} ({pbstr} -- best={best_unsat})",
+            desc=f"{newlines}restart {restart_ct} ({pbstr} -- best={best_unsat})",
             bar_format="{l_bar}{bar}|{elapsed}/" + f"{str(timeout_m).zfill(2)}:{str(timeout_s).zfill(2)}" + "{postfix}",
             postfix=f"{0:.2f}s/it",
         )
@@ -387,6 +389,7 @@ def run_solver(
 
         # Run solver.
         opt_x0, opt_unsat, opt_iters, opt_unsat_ct, aux_info = solver.run(x0_dev, fixed_vars, weights)
+        print(aux_info)
         accum_time_descent += time() - tloop
 
         flips = (opt_x0 > 0).sum(axis=1) - (x0 > 0).sum(axis=1)

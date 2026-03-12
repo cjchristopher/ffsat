@@ -242,7 +242,7 @@ class FFSatSolver(abc.ABC):
                 def opt(x: Array, fixed_vars: Array, weights: tuple[Array, ...]) -> tuple[Array, Array, Array, Array]:
                     x_opt, state = pgd.run(x, fixed_vars=fixed_vars, weights=weights, hyperparams_proj=(-1, 1))
                     unsat = jnp.squeeze(verifier(x_opt))
-                    return x_opt, unsat, jnp.atleast_1d(state.iter_num), state.aux
+                    return x_opt, jnp.atleast_1d(unsat), jnp.atleast_1d(state.iter_num), state.aux
 
             else:
                 pass
@@ -251,8 +251,7 @@ class FFSatSolver(abc.ABC):
                 xs: Array, fixed_vars: Array, weights: tuple[Array, ...]
             ) -> tuple[Array, Array, Array, Array, Array]:
                 x_opt, unsat, iters, evals = jax.vmap(opt, in_axes=(0, 0, None))(xs, fixed_vars, weights)
-                # jax.debug.print("min/max evals {}, {}, {}", jnp.min(evals), jnp.max(evals), evals.shape)
-                unsat_cl_count = jnp.sum(jnp.atleast_1d(unsat), axis=1)
+                unsat_cl_count = jnp.sum(jnp.atleast_2d(unsat), axis=1)
                 return x_opt, jnp.atleast_2d(unsat), iters, unsat_cl_count, evals
 
             self.run = jax.jit(vectorise, donate_argnums=(0))

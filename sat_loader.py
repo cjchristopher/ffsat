@@ -114,7 +114,7 @@ class PBSATFormula(object):
                            (e.g., conflicting unit literals, card > n).
             """
             lit_offset = 0
-            clause_type = "cnf" # default assumption
+            clause_type = "cnf"  # default assumption
 
             if tokens[0] == "h" or (tokens[0] == "1" and tokens[1] == "x"):  # "1 x" valid when using "h"
                 lit_offset = 1
@@ -158,7 +158,7 @@ class PBSATFormula(object):
             else:
                 card = 0
 
-            lits = [int(val) for val in tokens[lit_offset:-1]] # drop trailing 0
+            lits = [int(val) for val in tokens[lit_offset:-1]]  # drop trailing 0
             n = len(lits)
 
             # Clause extracted. Check for errors in spec, correct generic edge cases.
@@ -255,6 +255,17 @@ class PBSATFormula(object):
                             logger.error(f"Line {idx}: Malformed clause: {line}")
                             raise ValueError
                         __process_clause(idx, line, tokens)
+
+                calc_n_clause = sum([len(clause_set) for clause_set in self.clause_sets.values()])
+                calc_n_var = max([max([max(lits) for lits in clause_set]) for clause_set in self.clause_sets.values()])
+
+                if calc_n_clause != self.n_clause or calc_n_var != self.n_var:
+                    logger.warning(
+                        f"Metadata mismatch! Header specified {self.n_var} variables and {self.n_clause} clauses, "
+                        + f"but we processed {calc_n_var} variables and {calc_n_clause} clauses!"
+                    )
+                    self.n_clause = calc_n_clause
+                    self.n_var = calc_n_var
 
                 print(
                     f"Processed file: {dimacs_file}, with {len(self.clause_sets)} objectives (clause sets)"
@@ -368,7 +379,8 @@ class PBSATFormula(object):
                             conflict = self.unit_prefix.intersection(neg_lits)
                             if conflict:
                                 logger.warning(
-                                    f"Conflict ({conflict}) with unit literals in prefix-{idx}- skipping: {line}")
+                                    f"Conflict ({conflict}) with unit literals in prefix-{idx}- skipping: {line}"
+                                )
                                 skipped += 1
                                 continue
                             merged = prefix_lits | self.unit_prefix

@@ -14,7 +14,7 @@ We engineer this idea into a fully featured solver for GPU accelerators, hence *
 
 ### Prerequisites
 
-- Python >=3.10+
+- Python >=3.11+ (for JAX>=0.7.0) (see https://docs.jax.dev/en/latest/installation.html)
 - For JAX acceleration, a compatible GPU or TPU.
   
 Optionally, see https://github.com/NVIDIA/JAX-Toolbox for Docker images that may work.

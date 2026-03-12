@@ -241,7 +241,7 @@ class ClauseProcessor:
             \end{align*}$$
             No additional simplication here, beyond the special cases of $k=1$ or $k=n$, which are $\texttt{EO}$ and all True,
             respectively. For the former use the dedicated routine, for the latter it should be caught prior to this.
-            For more info see the documenation for __card()
+            For more info see the documentation for __card()
             """
             const = comb(n - 1, k - 1)
             g_coeffs_part = __int_noisepoly_coeffs(n - 1, n - k - 1, k - 1)
