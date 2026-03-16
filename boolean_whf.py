@@ -13,12 +13,16 @@ from functools import lru_cache
 from math import comb
 from typing import NamedTuple, overload
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 from jax import Array
 from numpy.typing import NDArray
 
 logger = logging.getLogger(__name__)
+jax.config.update("jax_platform_name", "gpu")  # gpu/cpu/tpu
+jax.config.update("jax_enable_x64", True)
+jax.config.update("jax_default_matmul_precision", "highest")
 
 type Clause = list[int]
 type Clauses = list[Clause]

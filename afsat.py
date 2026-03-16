@@ -72,7 +72,7 @@ jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
 # jax.config.update("jax_persistent_cache_enable_xla_caches", "all")
 
 # # DEBUGGING BLOCK
-# jax.config.update("jax_debug_nans", True)
+jax.config.update("jax_debug_nans", True)
 # jax.config.update("jax_log_compiles", True)
 # jax.config.update("jax_no_tracing", True)
 # jax.config.update("jax_disable_jit", True)
@@ -389,8 +389,28 @@ def run_solver(
 
         # Run solver.
         opt_x0, opt_unsat, opt_iters, opt_unsat_ct, aux_info = solver.run(x0_dev, fixed_vars, weights)
-        print(aux_info)
         accum_time_descent += time() - tloop
+
+        # Flag and bail if we encounter anomalous behaviour
+        if logger.level <= logging.WARNING:
+            eval_last = np.abs(np.asarray(aux_info[-1]))
+            eval_oob = (eval_last > n_clause) & (~np.isclose(eval_last, float(n_clause)))
+            if np.any(eval_oob):
+                exceed = np.argwhere(eval_oob).flatten()
+                logger.warning(
+                    f"[{sol_name}] Detected numerical instability! \n Abs(eval) > {n_clause} outside tolerance!\n"
+                    + f"At indices {exceed} in the most recent batch, we found:\n"
+                    + f"Energy/Eval values of: {np.asarray(aux_info[-1])[exceed]}\n"
+                    + f"due to an input of: \n{np.asarray(x0)[exceed, :]}"
+                )
+                x0_abs = np.abs(np.asarray(x0))
+                x0_oob = (x0_abs > 1.0) & (~np.isclose(x0_abs, 1.0))
+                if np.any(x0_oob):
+                    escaped = np.argwhere(x0_oob)
+                    logger.warning(f"[{sol_name}] Detected points outside tolerance at: {escaped}\n"
+                                   + f"Points: {x0[escaped]}")
+                if QUIT_ON_ANOMALY:
+                    return 0.0
 
         flips = (opt_x0 > 0).sum(axis=1) - (x0 > 0).sum(axis=1)
 
@@ -628,12 +648,12 @@ def run_solver(
             if assigned:
                 assignment.append(lit * -assigned)
 
-        logger.info(f"Best assignment found (0 energy output as ?lit) [{best_unsat} UNSAT]:")
+        logger.info(f"Best assignment found (0 energy denoted as ?lit) [{best_unsat} UNSAT]:")
         logger.info(f"{assign_str}")
 
         assignment = set(assignment)
         if logger.level <= logging.DEBUG:
-            logger.debug(f"UNSATS (set literals-clause literals):\n")
+            logger.debug("UNSATS (set literals-clause literals):\n")
             for i, cl_idx in enumerate(best_unsat_clauses_idx.flatten()):
                 find_idx = cl_idx
                 for obj in objs:
@@ -768,21 +788,29 @@ if __name__ == "__main__":
     ap.add_argument("-m", "--sample_meth", type=str, default="bias", help="Starting point sampler (bias,coin,uniform)")
     ap.add_argument("-q", "--solver_tol", type=float, default=1e-3, help="Solver convergence tolerance (if supported)")
     ap.add_argument("--stdout_log", action="store_true", help="Send log output to stdout instead of stderr")
+    ap.add_argument("--anomaly_quit", action="store_true", default=False)
+    ap.add_argument("--log_propagate", action="store_true", default=False)
 
     arg = ap.parse_args()
     logger.info(f"{arg._get_args()}")
 
+    QUIT_ON_ANOMALY: bool = arg.anomaly_quit
+
+
     if not arg.n_devices:
         arg.n_devices = n_devices
 
+    logger.propagate = True #arg.log_propagate
     logging.basicConfig(
         level=getattr(logging, arg.debug.upper()),
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        # format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        format="%(name)s - %(levelname)s - %(message)s",
         handlers=[
             logging.StreamHandler(sys.stdout if arg.stdout_log else sys.stderr),
             # Optional: logging.FileHandler('sat_loader.log')  # Also log to file
         ],
     )
+
     # Run with or without profiler based on the flag
     profiler = jax.profiler.trace("/tmp/jax-trace", create_perfetto_link=False) if arg.profile else nullcontext()
     with profiler:

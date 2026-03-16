@@ -33,7 +33,9 @@ from scipy.optimize import minimize as ScipyMinimize
 from boolean_whf import Objective, clause_type_ids
 
 logger = logging.getLogger(__name__)
-
+jax.config.update("jax_platform_name", "gpu")  # gpu/cpu/tpu
+jax.config.update("jax_enable_x64", True)
+jax.config.update("jax_default_matmul_precision", "highest")
 
 # TODO: Import specific solver modules when needed
 # from . import hj_mad
@@ -97,7 +99,7 @@ def build_eval_verify(objs: tuple[Objective, ...], unbounded: bool) -> tuple[tup
         def evaluate_xor(x: Array, fixed_vars: Array, weight: Array) -> Array:
             x = jnp.where(fixed_vars, jax.lax.stop_gradient(x), x)
             assignment = sign * x[lits]                                           # (N,K) * (N,K) = (N,K)
-            clause_eval = jnp.prod(assignment, axis=-1)                          # (N,)
+            clause_eval = jnp.prod(assignment, axis=-1)                           # (N,)
             weighted_eval = weight * clause_eval                                  # (N,) * (N,) = (N,)
             x_eval = jnp.sum(weighted_eval, axis=-1)                              # (1,)
             if not unbounded:
@@ -107,24 +109,11 @@ def build_eval_verify(objs: tuple[Objective, ...], unbounded: bool) -> tuple[tup
                 return ((jnp.atleast_1d(x_eval)+1)/2)**2 + (x**2 - 1)**(lits.shape[-1])
 
         def evaluate(x: Array, fixed_vars: Array, weight: Array) -> Array:
-            #TODO: Create an eval_rules dict (like above unsat_rules) that only applies the full transform
-            # for clause types that need it. e.g. XOR can be shortcut substantially if we close over the types.
-
-            #TODO: Re-inline this function at some point. I'm no longer convinced jax.checkpoint helps us here.
-            #@jax.checkpoint
-            # def fourier_checkpoint(x: Array) -> Array:
-            #     assignment = sign * x[lits]                                       # (N,K) * (N,K) = (N,K)
-            #     # Add dimension to capture K+1 shifted roots for K terms of the clause.
-            #     fourier_domain = dft + assignment[:, None, :]                     # (N,(K+1),1) + (N,_,K) = (N,(K+1),K)
-            #     esp_freq = jnp.prod(fourier_domain, axis=-1, where=forward_mask)
-            #     return esp_freq                                                   # (N,(K+1))
-
             x = jnp.where(fixed_vars, jax.lax.stop_gradient(x), x)
             assignment = sign * x[lits]                                           # (N,K) * (N,K) = (N,K)
             # Add dimension to capture K+1 shifted roots for K terms of the clause.
             fourier_domain = dft + assignment[:, None, :]                         # (N,(K+1),1) + (N,_,K) = (N,(K+1),K)
-            esp_freq = jnp.prod(fourier_domain, axis=-1, where=forward_mask)
-            # esp_freq = fourier_checkpoint(x)                                      # (N,(K+1))
+            esp_freq = jnp.prod(fourier_domain, axis=-1, where=forward_mask)      # (N,(K+1))
             esp_eval = idft * esp_freq                                            # (1,(K+1)) * (N,(K+1)) = (N,(K+1))
             clause_eval = jnp.sum(esp_eval.real, axis=-1)                         # (N,)
             weighted_eval = weight * clause_eval                                  # (N,) * (N,) = (N,)
