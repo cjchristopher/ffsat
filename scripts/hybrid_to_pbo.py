@@ -21,6 +21,20 @@ def parse_cardinality_constraint(card, vars) -> str:
     return pbo_constraint
 
 
+def parse_exactly_k_constraint(card, vars) -> str:
+    # Convert cardinality constraint
+    sign = "+"
+    try:
+        card = int(card)
+    except Exception as e:
+        raise e
+
+    # Convert variables to PBO format (xN for positive, ~xN for negative)
+    pbo_vars = [f"{sign}1 {'~x' if v < 0 else 'x'}{abs(v)}" for v in vars]
+    pbo_constraint = " ".join(pbo_vars) + f" = {card};"
+    return pbo_constraint
+
+
 def parse_exactly_one_constraint(vars) -> str:
     pbo_vars = [f"+1 {'~x' if v < 0 else 'x'}{abs(v)}" for v in vars]
     pbo_constraint = " ".join(pbo_vars) + " = 1;"
@@ -71,11 +85,17 @@ def convert_file(input_file, output_file) -> None:
                     cls_cnt = int(words[3])
                     continue
 
+            if words[0] == "h":
+                words = words[1:]
+
             line_type = words[0]
             vars = [int(v) for v in words[1:-1]]
+
             match line_type:
                 case "d" | "card":
                     pbo_constraint = parse_cardinality_constraint(vars[0], vars[1:])
+                case "k" | "ek":
+                    pbo_constraint = parse_exactly_k_constraint(vars[0], vars[1:])
                 case "e" | "eo":
                     pbo_constraint = parse_exactly_one_constraint(vars)
                 case "a" | "amo":

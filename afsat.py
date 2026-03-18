@@ -279,19 +279,19 @@ def run_solver(
     guess_batch = 0
     if batch == -1:
         logger.info("Guessing optimal batch size")
-        # Optimal throughput is achieved when working set fits in GPU L2 cache.
-        # Fall back to 1% of VRAM if L2 cache size is unavailable.
+        # Optimal throughput is achieved when working set fits in GPU on-chip cache.
+        # Fall back to 1% of VRAM if cache size is unavailable.
         l2_cache_size = get_gpu_l2_cache_size(devices[0])
         if l2_cache_size is not None:
-            # Target ~80% of L2 cache to leave room for other data
+            # Target ~95% of detected cache budget to leave room for other data
             gpu_mem_target = int(l2_cache_size * 0.95) * n_devices * 2
-            logger.info(f"Targeting L2 cache: {l2_cache_size / (1024*1024):.1f} MB per GPU")
+            logger.info(f"Targeting total cache: {l2_cache_size / (1024*1024):.1f} MB per GPU")
 
         else:
             ### Dead branch for now - the above call builds in a sensible default.
             # Fallback: 1% of VRAM heuristic
             gpu_mem_target = devices[0].memory_stats()["bytes_limit"] * 0.01
-            logger.info("L2 cache size unknown, using 1% VRAM heuristic")
+            logger.info("Cache size unknown, using 1% VRAM heuristic")
         dtype_sz = jnp.dtype(objs[0].ffts.dft.dtype).itemsize
         all_obj_sz = sum([np.prod([max(o.clauses.lits.shape), max(o.ffts.dft.shape) ** 2, dtype_sz]) for o in objs])
         guess_batch = int(np.floor(gpu_mem_target / (all_obj_sz))) * n_devices

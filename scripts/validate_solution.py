@@ -12,12 +12,21 @@ Example:
 The solution file should contain space-separated literals where:
     - Positive integer N means variable N is TRUE
     - Negative integer -N means variable N is FALSE
+    e.g: 
+    -1 -2 -3 -4 -5 -6 -7 -8 9 -10 -11 12 -13 
 """
 
 from __future__ import annotations
 
 import argparse
 import sys
+import os
+from pathlib import Path
+fparent = Path(__file__).resolve().parent
+if fparent == Path.cwd():
+    sys.path.insert(1, os.path.abspath("../"))
+else:
+    sys.path.insert(1, str(fparent.parent))
 
 import jax.numpy as jnp
 import numpy as np

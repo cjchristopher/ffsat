@@ -53,45 +53,40 @@ class FFSATConfig:
 
 def get_gpu_l2_cache_size(device) -> int | None:
     """
-    Query the effective on-chip cache/memory size of a GPU in bytes.
+    Query total on-chip cache capacity of a GPU in bytes.
     Returns None if unable to determine.
 
-    Note: Returns an "effective working set" size that empirically yields good throughput,
-    balancing cache utilization with sufficient parallelism. Based on empirical testing,
-    optimal working set is often larger than raw L2 size.
-
-    Tries pynvml first (for L2 only), falls back to known GPU lookup table with
-    empirically-tuned values.
+    Returns a model-based estimate of L1 + L2 (+ L3 if present) cache capacity.
+    Function name is kept for backward compatibility with existing call sites.
     """
-    # Fallback: lookup table by GPU name
-    # Values are "effective working set" estimates based on empirical throughput testing
-    # Optimal balances cache residency vs parallelism (typically 0.1-0.2% of VRAM)
+    # Lookup table by GPU name.
+    # Values target total cache budget (L1 + L2 + L3 where present), in bytes.
+    # For NVIDIA parts listed here, totals are L1+L2 (no dedicated L3 on these models).
     CACHE_TABLE = {
-        # Volta (L2=6MB) - empirical optimal ~0.1-0.4% of 32GB VRAM = 32-130MB, target middle
-        "V100": 48 * 1024 * 1024,  # 48 MB (~0.15% of 32GB)
-        # Ampere (large L2 caches)
-        "A100": 80 * 1024 * 1024,  # 80 MB (40MB L2, but more parallelism helps)
-        "A6000": 24 * 1024 * 1024,  # 24 MB (~0.05% of 48GB)
-        "A5000": 20 * 1024 * 1024,  # 20 MB
-        "A4000": 12 * 1024 * 1024,  # 12 MB
-        "RTX 3090": 24 * 1024 * 1024,  # 24 MB (~0.1% of 24GB)
-        "RTX 3080": 12 * 1024 * 1024,  # 12 MB
-        "RTX 3070": 8 * 1024 * 1024,  # 8 MB
-        # Hopper (very large L2)
-        "H100": 100 * 1024 * 1024,  # 100 MB (50MB L2 + parallelism headroom)
-        "H200": 100 * 1024 * 1024,  # 100 MB
-        # Ada Lovelace (large L2 caches - use ~1.5x L2 for parallelism)
-        "RTX 4090": 96 * 1024 * 1024,  # 96 MB (72MB L2)
-        "RTX 4080": 80 * 1024 * 1024,  # 80 MB (64MB L2)
-        "RTX 4070": 48 * 1024 * 1024,  # 48 MB (36MB L2)
-        "RTX A2000": 4 * 1024 * 1024,
-        "RTX A4000": 6 * 1024 * 1024,
-        "RTX A5000": 8 * 1024 * 1024,
-        "RTX A6000": 6 * 1024 * 1024,
-        "L40": 64 * 1024 * 1024,  # 64 MB (48MB L2)
+        "V100": int(16 * 1024 * 1024),  # ~6MB L2 + ~10MB aggregate L1
+        # Ampere
+        "A100": int(60.25 * 1024 * 1024),  # 40MB L2 + 20.25MB aggregate L1
+        "A6000": int(16.5 * 1024 * 1024),  # 6MB L2 + 10.5MB aggregate L1
+        "A5000": int(14 * 1024 * 1024),  # 6MB L2 + 8MB aggregate L1
+        "A4000": int(10 * 1024 * 1024),  # 4MB L2 + 6MB aggregate L1
+        "RTX 3090": int(16.25 * 1024 * 1024),  # 6MB L2 + 10.25MB aggregate L1
+        "RTX 3080": int(13.5 * 1024 * 1024),  # 5MB L2 + 8.5MB aggregate L1
+        "RTX 3070": int(9.75 * 1024 * 1024),  # 4MB L2 + 5.75MB aggregate L1
+        # Hopper
+        "H100": int(80 * 1024 * 1024),  # 50MB L2 + ~30MB aggregate L1
+        "H200": int(83 * 1024 * 1024),  # 50MB L2 + ~33MB aggregate L1
+        # Ada Lovelace
+        "RTX 4090": int(88 * 1024 * 1024),  # 72MB L2 + 16MB aggregate L1
+        "RTX 4080": int(73.5 * 1024 * 1024),  # 64MB L2 + 9.5MB aggregate L1
+        "RTX 4070": int(41.75 * 1024 * 1024),  # 36MB L2 + 5.75MB aggregate L1
+        "RTX A2000": int(7.25 * 1024 * 1024),  # 4MB L2 + 3.25MB aggregate L1
+        "RTX A4000": int(10 * 1024 * 1024),  # 4MB L2 + 6MB aggregate L1
+        "RTX A5000": int(14 * 1024 * 1024),  # 6MB L2 + 8MB aggregate L1
+        "RTX A6000": int(16.5 * 1024 * 1024),  # 6MB L2 + 10.5MB aggregate L1
+        "L40": int(65.75 * 1024 * 1024),  # 48MB L2 + ~17.75MB aggregate L1
         # Blackwell
-        "B100": 96 * 1024 * 1024,  # 96 MB (estimated)
-        "B200": 96 * 1024 * 1024,  # 96 MB (estimated)
+        "B100": int(128 * 1024 * 1024),  # Estimated total cache
+        "B200": int(160 * 1024 * 1024),  # Estimated total cache
     }
     gpu_name = device.device_kind
     for key, size in CACHE_TABLE.items():
