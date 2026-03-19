@@ -4,7 +4,7 @@ AFSAT is a native pseudo-Boolean (PB) Continuous Local Search (CLS) Satisfiabili
 
 The approach takes advantage of the JAX ecosystem, a modern high performance scientific computing framework, leveraging automatic differentiation and efficient optimization for fast distributed GPU kernels.
 
-This work is based on recent theoretical advances by Kyrillidis *et al*[^1] and a proof-of-concept demonstration by Cen *et al*[^2]. The code presented here is an implementation from scratch, and supports arbitrary PB-SAT problems that can be expressed in any combination of the constraint types enumerated below.
+This work is based on recent theoretical advances by Kyrillidis *et al*<sup>[<a href="#ref-1">1</a>]</sup> and a proof-of-concept demonstration by Cen *et al*<sup>[<a href="#ref-2">2</a>]</sup>. The code presented here is a new implementation from scratch, and supports arbitrary PB-SAT problems that can be expressed in any combination of the constraint types enumerated below.
 
 A note on naming convention: Neither this code, nor the proof-of-concept work, uses a *fast Fourier* algorithm. The underlying transform is a *Fourier* transform, hence *Fourier SAT*.
 After this transform, this solver utilises a second discrete Fourier transform for fast polynomial evaluation on GPU, from which the *fast* is derived. 
@@ -14,7 +14,7 @@ We engineer this idea into a fully featured solver for GPU accelerators, hence *
 
 ### Prerequisites
 
-- Python >=3.11+ (for JAX>=0.7.0) (see https://docs.jax.dev/en/latest/installation.html)
+- Python >=3.12+ (for JAX>=0.7.0) (see https://docs.jax.dev/en/latest/installation.html)
 - For JAX acceleration, a compatible GPU or TPU.
   
 Optionally, see https://github.com/NVIDIA/JAX-Toolbox for Docker images that may work.
@@ -62,7 +62,8 @@ This solver extends the DIMACS format to support various constraint types using 
 1. Constraint lines either:
    - Start with `h` (hybrid marker), e.g., `h 1 2 0`
    - Start with constraint type directly, e.g., `xor 1 2 0`
-   - For standard CNF clauses, no prefix is needed, e.g., `1 2 0`
+   - Or both for explicitly clarity e.g., `h eo 1 2 0`
+   - For standard CNF clauses, no prefix is needed, e.g., `1 2 0`, but prefix with a single `h` is supported.
 
 2. Supported constraint types:
 
@@ -136,44 +137,43 @@ python afsat.py [options] input_file.cnf
 - `-m, --sample_meth STR`: New candidate assignments can be randomly sampled in various ways. Default is `bias`, options are `bias, coin, uniform, trunc`. Documentation TBD.
 - `-q, --solver_tol FLOAT`: For convergence criteria solvers (e.g. gradient descent), overrides the default threshold for which convergence is deemed to have been met.
 - `--stdout_log`: Sends output from logger (e.g. when `--debug` is set) to stdout instead of stderr.
+- `--anomaly_quit`: Will cause the solver to immediately halt if numerical instability is detected (e.g. total evaluation is outside expected bounds)
 
 ### Examples
 
 Basic usage:
 ```bash
-    python afsat.py problem.cnf
-    # OR
-    python afsat.py problem.hybrid
+    python afsat.py problem_file
 ```
 
 Running with a 10-minute timeout and specific batch size:
 ```bash
-    python afsat.py problem.cnf -t 600 -b 32
+    python afsat.py problem_file -t 600 -b 32
 ```
 
 Enable five fuzzing passes per batch:
 ```bash
-    python afsat.py problem.cnf -f 5
+    python afsat.py problem_file -f 5
 ```
 
 Run with debugging enabled and profiling:
 ```bash
-    python afsat.py problem.cnf -d DEBUG -p
+    python afsat.py problem_file -d DEBUG -p
 ```
 
 Use a prefix file with fixed variable assignments:
 ```bash
-    python afsat.py problem.cnf -p prefix.txt
+    python afsat.py problem_file -p prefix.txt
 ```
 
 Use specific number of GPUs with custom iteration depth:
 ```bash
-    python afsat.py problem.cnf -n 2 -i 200
+    python afsat.py problem_file_ -n 2 -i 200
 ```
 
 Counting mode - find all solutions within 5 minutes:
 ```bash
-    python afsat.py problem.cnf -t 300 -c 1
+    python afsat.py problem_file_ -t 300 -c 1
 ```
 
 ## Output
@@ -218,7 +218,32 @@ License texts: see `LICENSE-APACHE` (Apache 2.0) and `LICENSE` (GPL v2).
 
 Contributions are accepted under the same dual-license terms.
 
+### Citation
+If you use AFSAT in your research, please cite as appropriate (n.b. publication DOI to follow in future update):
+
+```bibtex
+@unpublished{christopher26-cls,
+  title={A Study of Parallel Continuous Local Search},
+  author={Christopher, Cody and Gretton, Charles},
+  year={2026}
+}
+
+@unpublished{christopher26-afsat,
+  title={Accelerated Fourier SAT: Fully Realising a GPU-based Pseudo-Boolean SAT Solver},
+  author={Christopher, Cody and Gretton, Charles},
+  year={2026}
+}
+
+@software{christopher26-afsat-git,
+  title={Accelerated Fourier SAT (AFSAT): Fast (GPU Accelerated) Fourier-SAT Solver},
+  author={Christopher, Cody and Gretton, Charles},
+  year={2026},
+  url={https://github.com/cjchristoper/accelerated-fourier-sat}
+}
+```
+
 #### References
+<a id="ref-1"></a>
 1: Kyrillidis, A., Shrivastava, A., Vardi, M. Y., & Zhang, Z. (2021).
 *Solving hybrid Boolean constraints in continuous space via multilinear Fourier expansions*.
 Artificial Intelligence, 299, 103559.
@@ -226,6 +251,7 @@ Artificial Intelligence, 299, 103559.
 [![arXiv](https://img.shields.io/badge/PDF-Paper-red)](https://akyrillidis.github.io/pubs/Journals/fourierSAT.pdf)
 [![GitHub](https://img.shields.io/badge/GitHub-FourierSAT-181717?logo=github)](https://github.com/vardigroup/FourierSAT)
 
+<a id="ref-2"></a>
 2: Cen, Y., Zhang, Z., & Fong, X. (2025).
 *Massively Parallel Continuous Local Search for Hybrid SAT Solving on GPUs*.
 Proceedings of the AAAI Conference on Artificial Intelligence, 39(11), 11140-11149.
