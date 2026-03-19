@@ -507,13 +507,14 @@ def run_solver(
 
         if found_sol:
             first_sol = tuple(np.sign(best_x).astype(int).tolist())
-            if not counting:
-                break
             sol_locs = jnp.argwhere(jnp.where(opt_unsat_ct < 1, 1, 0)).flatten().tolist()
             batch_sols = [tuple(row.astype(int).tolist()) for row in np.sign(np.asarray(opt_x0[sol_locs, :]))]
-            for sol in batch_sols:
-                all_sols[sol] += 1
-            if not benchmark:
+            if not counting:
+                all_sols[tuple(np.sign(opt_x0[batch_best_loc, :]).astype(int).tolist())] += 1
+            else:
+                for sol in batch_sols:
+                    all_sols[sol] += 1
+            if not benchmark and not counting:
                 for x in range(len(histbars)):
                     histbars[x].close()
                 for x in range(len(infobars)):
