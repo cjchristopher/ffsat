@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0 OR GPL-2.0-or-later
+# ruff: disable[E402]
 from __future__ import annotations
 
 import functools
@@ -10,6 +11,7 @@ from argparse import ArgumentParser as ArgParse
 from collections import Counter, defaultdict
 from contextlib import nullcontext
 from time import perf_counter as time
+from typing import TypeAlias, overload
 
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"  # Disable pre-allocation
 os.environ["XLA_CLIENT_MEM_FRACTION"] = "0.95"  # Use full memory allocation
@@ -37,10 +39,29 @@ os.environ.update(
     }
 )
 
-from typing import TypeAlias, overload
-
 import jax
 import jax.numpy as jnp
+# TODO: Disable x64 when clauses are short enough - find this limit.
+jax.config.update("jax_platform_name", "gpu")  # gpu/cpu/tpu
+jax.config.update("jax_enable_x64", True)
+jax.config.update("jax_default_matmul_precision", "highest")
+jax.config.update("jax_use_shardy_partitioner", True)
+jax.config.update("jax_memory_fitting_level", "O3")
+jax.config.update("jax_optimization_level", "O3")
+jax.config.update("jax_compiler_enable_remat_pass", True)
+jax.config.update("jax_compilation_cache_dir", "/tmp/jax-cache")
+jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
+jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
+# jax.config.update("jax_persistent_cache_enable_xla_caches", "all")
+# # DEBUGGING BLOCK
+jax.config.update("jax_debug_nans", True)
+# jax.config.update("jax_log_compiles", True)
+# jax.config.update("jax_no_tracing", True)
+# jax.config.update("jax_disable_jit", True)
+# jax.config.update("jax_enable_checks", True)
+# jax.config.update("jax_explain_cache_misses", True)
+# jax.config.update("jax_check_tracer_leaks", True)
+
 #import jax_array_info as jai
 import numpy as np
 from jax import Array
@@ -54,31 +75,6 @@ from sat_loader import PBSATFormula
 from solvers import FFSatSolver, build_eval_verify, seq_eval_verify
 
 logger = logging.getLogger(__name__)
-
-if jax.__version_info__[1] < 7:
-    jax.P = jax.sharding.PartitionSpec
-
-# TODO: Disable x64 when clauses are short enough - find this limit.
-jax.config.update("jax_platform_name", "gpu")  # gpu/cpu/tpu
-jax.config.update("jax_enable_x64", True)
-jax.config.update("jax_default_matmul_precision", "highest")
-jax.config.update("jax_use_shardy_partitioner", True)
-jax.config.update("jax_memory_fitting_level", "O3")
-jax.config.update("jax_optimization_level", "O3")
-jax.config.update("jax_compiler_enable_remat_pass", True)
-jax.config.update("jax_compilation_cache_dir", "/tmp/jax-cache")
-jax.config.update("jax_persistent_cache_min_entry_size_bytes", -1)
-jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
-# jax.config.update("jax_persistent_cache_enable_xla_caches", "all")
-
-# # DEBUGGING BLOCK
-jax.config.update("jax_debug_nans", True)
-# jax.config.update("jax_log_compiles", True)
-# jax.config.update("jax_no_tracing", True)
-# jax.config.update("jax_disable_jit", True)
-# jax.config.update("jax_enable_checks", True)
-# jax.config.update("jax_explain_cache_misses", True)
-# jax.config.update("jax_check_tracer_leaks", True)
 # fh = logging.FileHandler(filename="jax.log")
 # fh.setLevel(logging.DEBUG)
 # logging.basicConfig(level=logging.INFO)
@@ -90,6 +86,10 @@ jax.config.update("jax_debug_nans", True)
 # jaxlog.addHandler(fh)
 # jaxlog.propagate = False
 
+# ruff: enable[E402]
+
+if jax.__version_info__[1] < 7:
+    jax.P = jax.sharding.PartitionSpec
 print = functools.partial(print, flush=True)
 ShardSpec: TypeAlias = tuple[NamedSharding, tuple[NamedSharding, ...]]
 

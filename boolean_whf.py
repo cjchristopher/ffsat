@@ -11,22 +11,20 @@ from functools import lru_cache
 
 # from itertools import accumulate
 from math import comb
-from typing import NamedTuple, overload
+from typing import NamedTuple, overload, TypeAlias
 
-import jax
 import jax.numpy as jnp
 import numpy as np
 from jax import Array
 from numpy.typing import NDArray
 
 logger = logging.getLogger(__name__)
-jax.config.update("jax_platform_name", "gpu")  # gpu/cpu/tpu
-jax.config.update("jax_enable_x64", True)
-jax.config.update("jax_default_matmul_precision", "highest")
 
-type Clause = list[int]
-type Clauses = list[Clause]
-
+# TODO: When we enforce python 3.12, swap to `type X = Y` globally.
+# type Clause = list[int]
+# type Clauses = list[Clause]
+Clause: TypeAlias = list[int]
+Clauses: TypeAlias = list[Clause]
 
 class ClauseSignature(NamedTuple):
     type: str

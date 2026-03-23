@@ -33,9 +33,6 @@ from scipy.optimize import minimize as ScipyMinimize
 from boolean_whf import Objective, clause_type_ids
 
 logger = logging.getLogger(__name__)
-jax.config.update("jax_platform_name", "gpu")  # gpu/cpu/tpu
-jax.config.update("jax_enable_x64", True)
-jax.config.update("jax_default_matmul_precision", "highest")
 
 # TODO: Import specific solver modules when needed
 # from . import hj_mad
