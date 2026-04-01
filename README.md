@@ -14,7 +14,7 @@ We engineer this idea into a fully featured solver for GPU accelerators, hence *
 
 ### Prerequisites
 
-- Python >=3.12+ (for JAX>=0.7.0) (see https://docs.jax.dev/en/latest/installation.html)
+- Python >=3.10+ (for JAX>=0.7.0) (see https://docs.jax.dev/en/latest/installation.html)
 - For JAX acceleration, a compatible GPU or TPU.
   
 Optionally, see https://github.com/NVIDIA/JAX-Toolbox for Docker images that may work.
@@ -219,26 +219,45 @@ License texts: see `LICENSE-APACHE` (Apache 2.0) and `LICENSE` (GPL v2).
 Contributions are accepted under the same dual-license terms.
 
 ### Citation
-If you use AFSAT in your research, please cite as appropriate (n.b. publication DOI to follow in future update):
+If you use AFSAT in your research, please cite both the tool paper and the software artifact.
+The two companion papers below are currently submitted for publication; fields such as DOI, pages, and publisher are placeholders pending acceptance and final publication metadata.
+Until venue metadata is finalized, cite the manuscript (or arXiv preprint, when available) together with the software artifact.
+For software citation, cite the exact version used, preferring a release DOI, then a release tag, otherwise an exact commit hash.
 
 ```bibtex
-@unpublished{christopher26-cls,
-  title={A Study of Parallel Continuous Local Search},
-  author={Christopher, Cody and Gretton, Charles},
-  year={2026}
-}
-
 @unpublished{christopher26-afsat,
   title={Accelerated Fourier SAT: Fully Realising a GPU-based Pseudo-Boolean SAT Solver},
   author={Christopher, Cody and Gretton, Charles},
-  year={2026}
+  year={2026},
+  note={Submitted for peer review and publication}
+  % archivePrefix={arXiv},
+  % eprint={TBD},
+  % primaryClass={cs.AI},
+  % booktitle={Proceedings of the 29th International Conference on Theory and Applications of Satisfiability Testing (SAT 2026)},
+  % doi={TBD},
+  % pages={TBD},
+  % publisher={TBD}
 }
 
 @software{christopher26-afsat-git,
   title={Accelerated Fourier SAT (AFSAT): Fast (GPU Accelerated) Fourier-SAT Solver},
   author={Christopher, Cody and Gretton, Charles},
   year={2026},
-  url={https://github.com/cjchristoper/accelerated-fourier-sat}
+  url={https://github.com/cjchristopher/accelerated-fourier-sat}
+}
+
+@unpublished{christopher26-cls,
+  title={A Study of Parallel Continuous Local Search},
+  author={Christopher, Cody and Gretton, Charles},
+  year={2026},
+  note={Submitted for peer review and publication}
+  % archivePrefix={arXiv},
+  % eprint={TBD},
+  % primaryClass={cs.AI},
+  % booktitle={Proceedings of the 29th International Conference on Theory and Applications of Satisfiability Testing (SAT 2026)},
+  % doi={TBD},
+  % pages={TBD},
+  % publisher={TBD}
 }
 ```
 

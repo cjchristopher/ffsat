@@ -6,7 +6,7 @@ import functools
 import logging
 from collections.abc import Callable
 from time import perf_counter as time
-from typing import TypeAlias
+from typing import Any, TypeAlias
 
 import jax
 import jax.numpy as jnp
@@ -41,8 +41,34 @@ logger = logging.getLogger(__name__)
 print = functools.partial(print, flush=True)
 
 EvalFn: TypeAlias = Callable[[Array, Array, Array], Array]
-SeqEvalFn: TypeAlias = Callable[[Array, Array, tuple[Array]], Array | tuple[Array, Array | tuple[Array, Array]]]
+SeqEvalFn: TypeAlias = Callable[[Array, Array, tuple[Array, ...]], Array | tuple[Array, Array | tuple[Array, Array]]]
 VerifyFn: TypeAlias = Callable[[Array], Array]
+UnsatRule: TypeAlias = Callable[[Array, Array, Array], Array]
+
+# fmt: off
+UNSAT_RULES: dict[str, UnsatRule] = {
+    "xor":  lambda x, mask, _    :  jnp.sum(x < 0, axis=1, where=mask) % 2 == 0,
+    "cnf":  lambda x, mask, _    :  jnp.min(x, axis=1, where=mask, initial=jnp.finfo(x.dtype).max) > 0,
+    "eo":   lambda x, mask, _    :  jnp.sum(x < 0, axis=1, where=mask) != 1,
+    "amo":  lambda x, mask, _    :  jnp.sum(x < 0, axis=1, where=mask) > 1,
+    "nae":  lambda x, mask, _    :  jnp.logical_not(
+                                        jnp.logical_and(
+                                            (jnp.min(x, axis=1, where=mask, initial=jnp.finfo(x.dtype).max) < 0),
+                                            (jnp.max(x, axis=1, where=mask, initial=jnp.finfo(x.dtype).min) > 0),
+                                        )
+                                    ),
+    "card": lambda x, mask, cards:  jnp.where(
+                                        cards < 0,
+                                        jnp.sum(x < 0, axis=1, where=mask) >= jnp.abs(cards),
+                                        jnp.sum(x < 0, axis=1, where=mask) < cards,
+                                    ),
+    "ek":   lambda x, mask, cards:  jnp.sum(x < 0, axis=1, where=mask) != cards,
+}
+# fmt: on
+
+
+def _bind_unsat_rule(template: UnsatRule, mask: Array, cards: Array) -> VerifyFn:
+    return lambda x, _t=template, _m=mask, _c=cards: _t(x, _m, _c)
 
 
 def build_eval_verify(objs: tuple[Objective, ...], unbounded: bool) -> tuple[tuple[EvalFn, ...], tuple[VerifyFn, ...]]:
@@ -73,25 +99,15 @@ def build_eval_verify(objs: tuple[Objective, ...], unbounded: bool) -> tuple[tup
         dft, idft = obj.ffts
         forward_mask = True if jnp.all(obj.forward_mask) else obj.forward_mask
         clause_count = lits.shape[0]
+        # Most objectives are homogeneous; prefilter to the relevant clause rules once.
+        type_ids_present = set(np.asarray(types).reshape(-1).tolist())
+        # print("binding rules:", [ctype for ctype in UNSAT_RULES.keys() if clause_type_ids[ctype] in type_ids_present])
+        relevant_rules = [
+            (clause_type_ids[clause_type], _bind_unsat_rule(template, mask, cards))
+            for clause_type, template in UNSAT_RULES.items()
+            if clause_type_ids[clause_type] in type_ids_present
+        ]
         # fmt: off
-        unsat_rules = {
-            "xor": lambda x: jnp.sum(x < 0, axis=1, where=mask) % 2 == 0,
-            "cnf": lambda x: jnp.min(x, axis=1, where=mask, initial=jnp.inf) > 0,
-            "eo":  lambda x: jnp.sum(x < 0, axis=1, where=mask) != 1,
-            "amo": lambda x: jnp.sum(x < 0, axis=1, where=mask) > 1,
-            "nae": lambda x: jnp.logical_not(
-                                jnp.logical_and(
-                                    (jnp.min(x, axis=1, where=mask, initial=jnp.inf) < 0),
-                                    (jnp.max(x, axis=1, where=mask, initial=-jnp.inf) > 0),
-                                )
-                            ),
-            "card": lambda x: jnp.where(
-                                cards < 0,
-                                jnp.sum(x < 0, axis=1, where=mask) >= jnp.abs(cards),
-                                jnp.sum(x < 0, axis=1, where=mask) < cards,
-                            ),
-            "ek": lambda x: jnp.sum(x < 0, axis=1, where=mask) != cards,
-        }
 
         def evaluate_xor(x: Array, fixed_vars: Array, weight: Array) -> Array:
             x = jnp.where(fixed_vars, jax.lax.stop_gradient(x), x)
@@ -126,15 +142,14 @@ def build_eval_verify(objs: tuple[Objective, ...], unbounded: bool) -> tuple[tup
             assignment = sign * x[lits]
             unsat = jnp.zeros(clause_count, dtype=bool)
 
-            for clause_type, rule in unsat_rules.items():
-                type_id = clause_type_ids[clause_type]
+            for type_id, rule in relevant_rules:
+                type_mask = types == type_id
                 unsat_clauses = rule(assignment)
-                unsat = unsat | jnp.where(types == type_id, unsat_clauses, unsat)
-
+                unsat = unsat | jnp.where(type_mask, unsat_clauses, False)
             return unsat
 
         eval_f = evaluate
-        if len(obj.clauses.types.flatten()) == 1 and obj.clauses.types.flatten()[0] == clause_type_ids["xor"]:
+        if jnp.all(types == clause_type_ids["xor"]):
             eval_f = evaluate_xor
         return eval_f, verify
 
@@ -152,6 +167,7 @@ def seq_eval_verify(eval_fns: tuple[EvalFn, ...], verify_fns: tuple[VerifyFn, ..
     def seq_evals(x: Array, fixed_vars: Array, weights: tuple[Array, ...]) -> tuple[Array, Array | tuple[Array, Array]]:
         costs = [evaluate(x, fixed_vars, weight) for (evaluate, weight) in zip(eval_fns, weights)]
         cost = jnp.sum(jnp.array(costs))
+        # jax.debug.print("{} {}", cost, costs, ordered=True)
         return cost, (x, cost)  # returns costs in aux for breakdown by objective. aux info - remove when consolidating
 
     def seq_verifies(x: Array) -> Array:
@@ -189,8 +205,10 @@ class FFSatSolver(abc.ABC):
 
                 def opt(x: Array, fixed_vars: Array, weights: tuple[Array, ...]) -> tuple[Array, Array, Array, Array]:
                     x_opt, state = lbfgs.run(init_params=x, fixed_vars=fixed_vars, weights=weights)
+                    final_cost, _ = evaluator(x_opt, fixed_vars, weights)
+                    final_aux: Any = (x_opt, final_cost)
                     unsat = jnp.squeeze(verifier(x_opt))
-                    return x_opt, unsat, jnp.atleast_1d(state.iter_num), state.aux
+                    return x_opt, unsat, jnp.atleast_1d(state.iter_num), final_aux
 
             if self.sol_name in ["unbounded"]:
                 gd = GradientDescent(fun=evaluator, maxiter=self.maxiter, has_aux=True)
@@ -198,8 +216,10 @@ class FFSatSolver(abc.ABC):
 
                 def opt(x: Array, fixed_vars: Array, weights: tuple[Array, ...]) -> tuple[Array, Array, Array, Array]:
                     x_opt, state = gd.run(init_params=x, fixed_vars=fixed_vars, weights=weights)
+                    final_cost, _ = evaluator(x_opt, fixed_vars, weights)
+                    final_aux: Any = (x_opt, final_cost)
                     unsat = jnp.squeeze(verifier(x_opt))
-                    return x_opt, unsat, jnp.atleast_1d(state.iter_num), state.aux
+                    return x_opt, unsat, jnp.atleast_1d(state.iter_num), final_aux
 
             if self.sol_name in ["lbfgsb"]:
                 lbfgsb = LBFGSB(fun=evaluator, maxiter=self.maxiter, has_aux=True)
@@ -208,8 +228,10 @@ class FFSatSolver(abc.ABC):
                 def opt(x: Array, fixed_vars: Array, weights: tuple[Array, ...]) -> tuple[Array, Array, Array, Array]:
                     bounds = (-1 * jnp.ones_like(x), jnp.ones_like(x))
                     x_opt, state = lbfgsb.run(init_params=x, fixed_vars=fixed_vars, weights=weights, bounds=bounds)
+                    final_cost, _ = evaluator(x_opt, fixed_vars, weights)
+                    final_aux: Any = (x_opt, final_cost)
                     unsat = jnp.squeeze(verifier(x_opt))
-                    return x_opt, unsat, jnp.atleast_1d(state.iter_num), state.aux
+                    return x_opt, unsat, jnp.atleast_1d(state.iter_num), final_aux
 
             elif self.sol_name in ["josp-lbfgsb"]:
                 spminB = ScipyBoundedMinimize(fun=evaluator, method="L-BFGS-B", maxiter=self.maxiter, has_aux=True)
@@ -218,8 +240,10 @@ class FFSatSolver(abc.ABC):
                 def opt(x: Array, fixed_vars: Array, weights: tuple[Array, ...]) -> tuple[Array, Array, Array, Array]:
                     bounds = (-1 * jnp.ones_like(x), jnp.ones_like(x))
                     x_opt, state = spminB.run(x, fixed_vars=fixed_vars, weights=weights, bounds=bounds)
+                    final_cost, _ = evaluator(x_opt, fixed_vars, weights)
+                    final_aux: Any = (x_opt, final_cost)
                     unsat = jnp.squeeze(verifier(x_opt))
-                    return x_opt, unsat, jnp.atleast_1d(state.iter_num), state.fun_val
+                    return x_opt, unsat, jnp.atleast_1d(state.iter_num), final_aux
 
             elif self.sol_name in ["pgd"]:
                 pgd = ProjectedGradient(fun=evaluator, projection=box, maxiter=self.maxiter, has_aux=True, tol=tol)
@@ -227,8 +251,10 @@ class FFSatSolver(abc.ABC):
 
                 def opt(x: Array, fixed_vars: Array, weights: tuple[Array, ...]) -> tuple[Array, Array, Array, Array]:
                     x_opt, state = pgd.run(x, fixed_vars=fixed_vars, weights=weights, hyperparams_proj=(-1, 1))
+                    final_cost, _ = evaluator(x_opt, fixed_vars, weights)
+                    final_aux: Any = (x_opt, final_cost)
                     unsat = jnp.squeeze(verifier(x_opt))
-                    return x_opt, jnp.atleast_1d(unsat), jnp.atleast_1d(state.iter_num), state.aux
+                    return x_opt, jnp.atleast_1d(unsat), jnp.atleast_1d(state.iter_num), final_aux
 
             else:
                 pass

@@ -15,26 +15,26 @@ The solution file should contain space-separated literals where:
     e.g: 
     -1 -2 -3 -4 -5 -6 -7 -8 9 -10 -11 12 -13 
 """
-
+# ruff: disable[E402]
 from __future__ import annotations
 
 import argparse
 import sys
 import os
 from pathlib import Path
+
 fparent = Path(__file__).resolve().parent
 if fparent == Path.cwd():
     sys.path.insert(1, os.path.abspath("../"))
 else:
     sys.path.insert(1, str(fparent.parent))
 
-import jax.numpy as jnp
 import numpy as np
-from jax import Array
-from boolean_whf import clause_type_ids
-from sat_loader import PBSATFormula
-from solvers.ffsatsolver import build_eval_verify
+from numpy.typing import NDArray
 
+from sat_loader import PBSATFormula
+
+# ruff: enable[E402]
 
 def load_solution_file(sol_file: str) -> str:
     """Load solution string from a .sol file."""
@@ -48,7 +48,7 @@ def load_solution_file(sol_file: str) -> str:
         return " ".join(lines)
 
 
-def parse_solution(solution_str: str, n_var: int) -> Array:
+def parse_solution(solution_str: str, n_var: int) -> NDArray[np.float32]:
     """
     Parse a solution string like "-1 2 -3 4 5" into an assignment array.
 
@@ -64,21 +64,43 @@ def parse_solution(solution_str: str, n_var: int) -> Array:
 
     # Assignment array: -1 means satisfied (literal matches), +1 means unsatisfied
     # This matches the convention used in ffsatsolver where sign * x[lits] < 0 means satisfied
-    assignment = jnp.zeros(n_var, dtype=jnp.float32)
+    assignment = np.zeros(n_var, dtype=np.float32)
 
     for lit in lits:
         var = abs(lit) - 1
-        if var > n_var:
+        if var >= n_var:
             print(f"Warning: Variable {var} exceeds n_var={n_var}, skipping")
             continue
         # Positive lit means var is TRUE -> assignment[var] = -1
         # Negative lit means var is FALSE -> assignment[var] = +1
-        assignment = assignment.at[var].set(-1.0 if lit > 0 else 1.0)
+        assignment[var] = -1.0 if lit > 0 else 1.0
 
     return assignment
 
 
-def get_unsatisfied_clauses(formula: PBSATFormula, assignment: Array) -> list[dict]:
+def _unsat_mask_for_type(clause_type: str, signed_assignments: NDArray[np.float32], card: int) -> NDArray[np.bool_]:
+    neg_count = np.sum(signed_assignments < 0, axis=1)
+
+    if clause_type == "xor":
+        return neg_count % 2 == 0
+    if clause_type == "cnf":
+        return np.min(signed_assignments, axis=1) > 0
+    if clause_type == "eo":
+        return neg_count != 1
+    if clause_type == "amo":
+        return neg_count > 1
+    if clause_type == "nae":
+        return ~((np.min(signed_assignments, axis=1) < 0) & (np.max(signed_assignments, axis=1) > 0))
+    if clause_type == "card":
+        if card < 0:
+            return neg_count >= abs(card)
+        return neg_count < card
+    if clause_type == "ek":
+        return neg_count != card
+    raise ValueError(f"Unknown clause type: {clause_type}")
+
+
+def get_unsatisfied_clauses(formula: PBSATFormula, assignment: NDArray[np.float32]) -> list[dict]:
     """
     Find all clauses unsatisfied by the given assignment.
 
@@ -89,38 +111,32 @@ def get_unsatisfied_clauses(formula: PBSATFormula, assignment: Array) -> list[di
         - 'objective_idx': which objective group it belongs to
         - 'clause_idx': index within that objective
     """
-    objectives = formula.process_clauses_to_array()
-    _, verify_fns = build_eval_verify(objectives, unbounded=False)
-
     unsatisfied = []
 
-    # Reverse lookup for clause type names
-    id_to_type = {v: k for k, v in clause_type_ids.items()}
+    # Iterate clause sets directly to avoid Objective/FFT construction overhead.
+    for obj_idx, (signature, clause_list) in enumerate(formula.clause_sets.items()):
+        if not clause_list:
+            continue
 
-    for obj_idx, (obj, verify_fn) in enumerate(zip(objectives, verify_fns)):
-        unsat_mask = verify_fn(assignment)
+        clause_arr = np.asarray(clause_list, dtype=np.int32)
+        signs = np.sign(clause_arr).astype(np.float32)
+        lit_idx = np.abs(clause_arr) - 1
+        signed_assignments = signs * assignment[lit_idx]
 
-        unsat_indices = np.where(np.array(unsat_mask.flatten()))[0]
+        unsat_mask = _unsat_mask_for_type(signature.type, signed_assignments, signature.card)
+        unsat_indices = np.where(unsat_mask)[0]
 
         for clause_idx in unsat_indices:
-            clause = set([x for x in (obj.clauses.sign * (obj.clauses.lits + 1))[clause_idx, :].tolist()])
-            if len(obj.clauses.types) == 1:
-                c_type = obj.clauses.types[0][0]
-            else:
-                c_type = obj.clauses.types[clause_idx][0]
-            if len(obj.clauses.cards) == 1:
-                c_card = obj.clauses.cards[0][0]
-            else:
-                c_card = obj.clauses.cards[clause_idx][0]
-            c_type = id_to_type.get(int(c_type), f"unknown({c_type})")
-            assign = set([int(-1 * assignment[x] * (abs(x) + 1)) for x in (obj.clauses.lits)[clause_idx, :].tolist()])
+            lits = clause_arr[clause_idx].tolist()
+            clause = set(int(x) for x in lits)
+            assigned = set(int(-assignment[abs(x) - 1] * abs(x)) for x in lits)
 
             unsatisfied.append(
                 {
-                    "clause_type": c_type,
-                    "cardinality": c_card,
+                    "clause_type": signature.type,
+                    "cardinality": signature.card,
                     "literals": clause,
-                    "assigned": assign,
+                    "assigned": assigned,
                     "objective_idx": obj_idx,
                     "clause_idx": int(clause_idx),
                 }
@@ -147,7 +163,7 @@ def format_clause(clause_info: dict) -> str:
     return retstr
 
 
-def main():
+def main() -> int:
     parser = argparse.ArgumentParser(
         description="Validate a solution against a SAT problem and report unsatisfied clauses"
     )
@@ -168,7 +184,7 @@ def main():
     print(f"Loading solution from: {args.solution_file}")
     solution_str = load_solution_file(args.solution_file)
     assignment = parse_solution(solution_str, formula.n_var)
-    assigned_count = int(jnp.sum(assignment != 0))
+    assigned_count = int(np.sum(assignment != 0))
     print(f"Solution assigns {assigned_count} variables")
 
     # Find unsatisfied clauses

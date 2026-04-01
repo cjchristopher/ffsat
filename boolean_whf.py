@@ -538,7 +538,7 @@ class ClauseProcessor:
                 dft[halfway:] = np.conj(dft[1 : halfway - (sig.len) % 2][::-1])
                 dft = dft.reshape(-1, 1)
 
-                idft_powers = np.array([[(i * j) % scale for i in range(scale)] for j in range(scale)], dtype=int)
+                idft_powers = np.array([[(i * j) % scale for i in range(scale)] for j in range(scale)], dtype=np.int32)
                 idft: NDArray = np.conjugate(dft[idft_powers].squeeze())
                 idft = (coeffs @ idft) / scale
                 clause_fft = FFT(dft, idft)
@@ -561,19 +561,14 @@ class ClauseProcessor:
             sign = np.sign(lits.flatten()[0])
         else:
             sign = np.where(mask, np.sign(lits), 0)
-        sign = jnp.array(sign)
+        sign = jnp.array(sign, dtype=jnp.int8)
 
         lits = np.where(mask, np.abs(lits) - 1, lits)  # adjust for 0 indexing
-        lits = jnp.array(lits)
+        lits = jnp.array(lits, dtype=jnp.int32)
         mask = jnp.atleast_2d(jnp.array(mask))
 
-        types = [clause_type_ids[sig.type] for sig in signatures]
-        types, _ = self._pad([[t] for t in types])
-        types = jnp.array(types)
-
-        cards = [sig.card for sig in signatures]
-        cards, _ = self._pad([[c] for c in cards])
-        cards = jnp.array(cards)
+        types = jnp.array([clause_type_ids[sig.type] for sig in signatures], dtype=jnp.int32)
+        cards = jnp.array([sig.card for sig in signatures], dtype=jnp.int32)
 
         return ClauseArrays(lits, sign, mask, types, cards)
 

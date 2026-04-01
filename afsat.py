@@ -55,6 +55,7 @@ jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
 # jax.config.update("jax_persistent_cache_enable_xla_caches", "all")
 # # DEBUGGING BLOCK
 jax.config.update("jax_debug_nans", True)
+# jax.config.update("jax_debug_infs", True)
 # jax.config.update("jax_log_compiles", True)
 # jax.config.update("jax_no_tracing", True)
 # jax.config.update("jax_disable_jit", True)
@@ -401,14 +402,21 @@ def run_solver(
                     f"[{sol_name}] Detected numerical instability! \n Abs(eval) > {n_clause} outside tolerance!\n"
                     + f"At indices {exceed} in the most recent batch, we found:\n"
                     + f"Energy/Eval values of: {np.asarray(aux_info[-1])[exceed]}\n"
-                    + f"due to an input of: \n{np.asarray(x0)[exceed, :]}"
+                    + f"due to an input of: \n{np.asarray(opt_x0)[exceed, :]}"
                 )
-                x0_abs = np.abs(np.asarray(x0))
-                x0_oob = (x0_abs > 1.0) & (~np.isclose(x0_abs, 1.0))
-                if np.any(x0_oob):
-                    escaped = np.argwhere(x0_oob)
-                    logger.warning(f"[{sol_name}] Detected points outside tolerance at: {escaped}\n"
-                                   + f"Points: {x0[escaped]}")
+                x_opt_abs = np.abs(np.asarray(opt_x0))
+                x_opt_oob = (x_opt_abs > 1.0) & (~np.isclose(x_opt_abs, 1.0))
+                if np.any(x_opt_oob):
+                    escaped = np.argwhere(x_opt_oob)
+                    logger.warning(f"[{sol_name}] Optimizer returned out-of-bounds points at: {escaped}\n"
+                                   + f"Points: {opt_x0[escaped]}")
+
+                aux_x_abs = np.abs(np.asarray(aux_info[0]))
+                aux_x_oob = (aux_x_abs > 1.0) & (~np.isclose(aux_x_abs, 1.0))
+                if np.any(aux_x_oob):
+                    escaped_aux = np.argwhere(aux_x_oob)
+                    logger.warning(f"[{sol_name}] Auxiliary evaluation points left bounds at: {escaped_aux}\n"
+                                   + f"Points: {aux_info[0][escaped_aux]}")
                 if QUIT_ON_ANOMALY:
                     return 0.0
 
