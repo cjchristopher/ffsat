@@ -397,7 +397,6 @@ def run_solver(
             eval_last = np.abs(np.asarray(aux_info[-1]))
             eval_oob = (eval_last > n_clause) & (~np.isclose(eval_last, float(n_clause)))
             if np.any(eval_oob):
-                print(eval_last)
                 exceed = np.argwhere(eval_oob).flatten()
                 logger.warning(
                     f"[{optimiser}] Detected numerical instability! \n Abs(eval) > {n_clause} outside tolerance!\n"
@@ -600,12 +599,12 @@ def run_solver(
                 pen_start = 0
                 new_weights: list[Array] = []
                 for weight in weights:
-                    n_clause = len(weight)
-                    pen_end = pen_start + n_clause
+                    obj_clauses = len(weight)
+                    pen_end = pen_start + obj_clauses
                     w_pens = penalty[pen_start:pen_end]
                     new_weight = weight_decay * weight + (1 - weight_decay) * w_pens / worst
                     new_weights.append(new_weight)
-                    pen_start += n_clause
+                    pen_start += obj_clauses
 
                 weights = shard_tree(tuple(new_weights), obj_sharding)
                 restart_batch_unsats = []
