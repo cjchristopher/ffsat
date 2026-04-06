@@ -73,7 +73,7 @@ from utils import get_gpu_l2_cache_size
 
 from boolean_whf import Objective
 from sat_loader import PBSATFormula
-from solvers import FFSatSolver, build_eval_verify, seq_eval_verify
+from solvers import Optimiser, build_eval_verify, seq_eval_verify
 
 logger = logging.getLogger(__name__)
 # fh = logging.FileHandler(filename="jax.log")
@@ -245,7 +245,7 @@ def run_solver(
     objs: tuple[Objective, ...],
     n_devices: int = 1,
     sample_method: str = "bias",
-    sol_name: str = "pgd",
+    optimiser: str = "pgd",
     warmup: bool = False,
     benchmark: bool = False,
     counting: int = 0,
@@ -268,9 +268,9 @@ def run_solver(
     weights = shard_tree(weights, obj_sharding)
 
     # Construct pure JAX functions (closures) and build solver.
-    obj_eval_fns, obj_verify_fns = build_eval_verify(objs, sol_name == "unbounded")
+    obj_eval_fns, obj_verify_fns = build_eval_verify(objs, optimiser == "unbounded")
     seq_evaluator, seq_verifier = seq_eval_verify(obj_eval_fns, obj_verify_fns)
-    solver = FFSatSolver(seq_evaluator, seq_verifier, solver=sol_name, maxiter=maxiters, tol=solver_tol)
+    solver = Optimiser(seq_evaluator, seq_verifier, algorithm=optimiser, maxiter=maxiters, tol=solver_tol)
 
     seed = int(time()) if rand_seed else 0
     logger.debug(f"seed={seed}, rand_seed={rand_seed}")
@@ -322,7 +322,7 @@ def run_solver(
             )
             empty_prefix = jax.device_put(jnp.full((batch, 1), fill_value=False, dtype=bool), batch_sharding)
 
-        if not benchmark and logger.level <= logging.DEBUG:
+        if not benchmark and logger.isEnabledFor(logging.DEBUG):
             if mesh.shape["batch"] > 1:
                 logger.info("Batch sharding:")
                 jax.debug.visualize_array_sharding(x_guess)
@@ -393,13 +393,14 @@ def run_solver(
         accum_time_descent += time() - tloop
 
         # Flag and bail if we encounter anomalous behaviour
-        if logger.level <= logging.WARNING:
+        if logger.isEnabledFor(logging.WARNING):
             eval_last = np.abs(np.asarray(aux_info[-1]))
             eval_oob = (eval_last > n_clause) & (~np.isclose(eval_last, float(n_clause)))
             if np.any(eval_oob):
+                print(eval_last)
                 exceed = np.argwhere(eval_oob).flatten()
                 logger.warning(
-                    f"[{sol_name}] Detected numerical instability! \n Abs(eval) > {n_clause} outside tolerance!\n"
+                    f"[{optimiser}] Detected numerical instability! \n Abs(eval) > {n_clause} outside tolerance!\n"
                     + f"At indices {exceed} in the most recent batch, we found:\n"
                     + f"Energy/Eval values of: {np.asarray(aux_info[-1])[exceed]}\n"
                     + f"due to an input of: \n{np.asarray(opt_x0)[exceed, :]}"
@@ -408,14 +409,14 @@ def run_solver(
                 x_opt_oob = (x_opt_abs > 1.0) & (~np.isclose(x_opt_abs, 1.0))
                 if np.any(x_opt_oob):
                     escaped = np.argwhere(x_opt_oob)
-                    logger.warning(f"[{sol_name}] Optimizer returned out-of-bounds points at: {escaped}\n"
+                    logger.warning(f"[{optimiser}] Optimizer returned out-of-bounds points at: {escaped}\n"
                                    + f"Points: {opt_x0[escaped]}")
 
                 aux_x_abs = np.abs(np.asarray(aux_info[0]))
                 aux_x_oob = (aux_x_abs > 1.0) & (~np.isclose(aux_x_abs, 1.0))
                 if np.any(aux_x_oob):
                     escaped_aux = np.argwhere(aux_x_oob)
-                    logger.warning(f"[{sol_name}] Auxiliary evaluation points left bounds at: {escaped_aux}\n"
+                    logger.warning(f"[{optimiser}] Auxiliary evaluation points left bounds at: {escaped_aux}\n"
                                    + f"Points: {aux_info[0][escaped_aux]}")
                 if QUIT_ON_ANOMALY:
                     return 0.0
@@ -661,7 +662,7 @@ def run_solver(
         logger.info(f"{assign_str}")
 
         assignment = set(assignment)
-        if logger.level <= logging.DEBUG:
+        if logger.isEnabledFor(logging.DEBUG):
             logger.debug("UNSATS (set literals-clause literals):\n")
             for i, cl_idx in enumerate(best_unsat_clauses_idx.flatten()):
                 find_idx = cl_idx
@@ -679,7 +680,7 @@ def run_solver(
             for i, w in enumerate(weights):
                 logger.debug(f"\t{set((np.array(objs[i].clauses.types)).flatten().tolist())},{objs[i].clauses.lits.shape} \n{w}")
 
-    if logger.level <= logging.INFO:
+    if logger.isEnabledFor(logging.INFO):
         if ttfs:
             logger.info(f"X-TTFS {ttfs}")
         logger.info("START EXP")
@@ -726,7 +727,8 @@ def main(
     maxiters: int = 100,
     unsat_h: float = 0,
     sample_method: str = "bias",
-    solver_tol: float = 1e-3
+    solver_tol: float = 1e-3,
+    optimiser: str = "pgd"
 ) -> None:
     if not file:
         raise ValueError("No problem file specified")
@@ -760,7 +762,8 @@ def main(
         maxiters=maxiters,
         unsat_h=int(unsat_h * 2 * n_var) if unsat_h else 0,
         sample_method=sample_method,
-        solver_tol=solver_tol
+        solver_tol=solver_tol,
+        optimiser=optimiser
     )
 
     logger.info(f"Time reading input: {read_time}")
@@ -796,6 +799,7 @@ if __name__ == "__main__":
     ap.add_argument("-u", "--unsat_thresh", type=float, default=0, help="Stop when #UNSAT drops below threshold (PLE)")
     ap.add_argument("-m", "--sample_meth", type=str, default="bias", help="Starting point sampler (bias,coin,uniform)")
     ap.add_argument("-q", "--solver_tol", type=float, default=1e-3, help="Solver convergence tolerance (if supported)")
+    ap.add_argument("-o", "--optimiser", "--optimizer", dest="optimiser", type=str, default="pgd", help="Optimisation routine")
     ap.add_argument("--stdout_log", action="store_true", help="Send log output to stdout instead of stderr")
     ap.add_argument("--anomaly_quit", action="store_true", default=False)
     ap.add_argument("--log_propagate", action="store_true", default=False)
@@ -838,7 +842,8 @@ if __name__ == "__main__":
             maxiters=arg.iters_desc,
             unsat_h=arg.unsat_thresh,
             sample_method=arg.sample_meth,
-            solver_tol=arg.solver_tol
+            solver_tol=arg.solver_tol,
+            optimiser=arg.optimiser
         )
         if arg.profile:
             jax.profiler.save_device_memory_profile("memory.prof")

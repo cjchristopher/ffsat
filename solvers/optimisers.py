@@ -178,16 +178,16 @@ def seq_eval_verify(eval_fns: tuple[EvalFn, ...], verify_fns: tuple[VerifyFn, ..
     return seq_evals, seq_verifies
 
 
-class FFSatSolver(abc.ABC):
+class Optimiser(abc.ABC):
     def __init__(
         self,
         evaluator: SeqEvalFn,
         verifier: VerifyFn,
-        solver: str = "lbfgsb",
+        algorithm: str = "lbfgsb",
         maxiter: int = 100,
         tol: float = 1e-3
     ) -> None:
-        self.sol_name = solver
+        self.algo = algorithm
         self.maxiter = maxiter
         self.warmup_sol = False
         self.memest = None
@@ -197,9 +197,9 @@ class FFSatSolver(abc.ABC):
         #     self.solver = BoundedBFGS()
         #     self.solver = optimistix.minimise(evaluator, BoundedBFGS, args={'weights': weights}, has_aux=True)
 
-        if self.sol_name in ["lbfgsb", "pgd", "josp-lbfgsb", "unbounded", "unbounded2"]:
+        if self.algo in ["lbfgsb", "pgd", "josp-lbfgsb", "unbounded", "unbounded2"]:
             # probably change to if sol_name in JAX_OPTIMS
-            if self.sol_name in ["unbounded2"]:
+            if self.algo in ["unbounded2"]:
                 lbfgs = LBFGS(fun=evaluator, maxiter=self.maxiter, has_aux=True)
                 logger.info("Setting up JAXOPT Squared L-BFGS:")
 
@@ -210,7 +210,7 @@ class FFSatSolver(abc.ABC):
                     unsat = jnp.squeeze(verifier(x_opt))
                     return x_opt, unsat, jnp.atleast_1d(state.iter_num), final_aux
 
-            if self.sol_name in ["unbounded"]:
+            if self.algo in ["unbounded"]:
                 gd = GradientDescent(fun=evaluator, maxiter=self.maxiter, has_aux=True)
                 logger.info("Setting up JAXOPT Squared L-BFGS:")
 
@@ -221,7 +221,7 @@ class FFSatSolver(abc.ABC):
                     unsat = jnp.squeeze(verifier(x_opt))
                     return x_opt, unsat, jnp.atleast_1d(state.iter_num), final_aux
 
-            if self.sol_name in ["lbfgsb"]:
+            if self.algo in ["lbfgsb"]:
                 lbfgsb = LBFGSB(fun=evaluator, maxiter=self.maxiter, has_aux=True)
                 logger.info("Setting up JAXOPT L-BFGS-B:")
 
@@ -233,7 +233,7 @@ class FFSatSolver(abc.ABC):
                     unsat = jnp.squeeze(verifier(x_opt))
                     return x_opt, unsat, jnp.atleast_1d(state.iter_num), final_aux
 
-            elif self.sol_name in ["josp-lbfgsb"]:
+            elif self.algo in ["josp-lbfgsb"]:
                 spminB = ScipyBoundedMinimize(fun=evaluator, method="L-BFGS-B", maxiter=self.maxiter, has_aux=True)
                 logger.info("Setting up JAXOPT ScipyBounded L-BFGS-B")
 
@@ -245,7 +245,7 @@ class FFSatSolver(abc.ABC):
                     unsat = jnp.squeeze(verifier(x_opt))
                     return x_opt, unsat, jnp.atleast_1d(state.iter_num), final_aux
 
-            elif self.sol_name in ["pgd"]:
+            elif self.algo in ["pgd"]:
                 pgd = ProjectedGradient(fun=evaluator, projection=box, maxiter=self.maxiter, has_aux=True, tol=tol)
                 logger.info("Setting up JAXOPT Projected Gradient (Box)")
 
@@ -268,19 +268,19 @@ class FFSatSolver(abc.ABC):
 
             self.run = jax.jit(vectorise, donate_argnums=(0))
 
-        elif self.sol_name in ["prox"]:
+        elif self.algo in ["prox"]:
             self.solver = ProximalGradient
             # self.solver = ProximalGradient(fun=evaluator, prox=hj_moreau, maxiter=self.maxiter)
             raise NotImplementedError("HJ Moreau Proximal Gradient not yet Implemented")
 
-        elif self.sol_name in ["nlcg"]:
+        elif self.algo in ["nlcg"]:
             self.solver = NonlinearCG
             raise NotImplementedError("Non-Linear Conjugate Gradient not yet Implemented")
 
-        elif self.sol_name in ["langevin"]:
+        elif self.algo in ["langevin"]:
             raise NotImplementedError("Langevin Annealing not yet Implemented")
 
-        elif self.sol_name in ["sp-lbfgsb"]:
+        elif self.algo in ["sp-lbfgsb"]:
             # We can only sensibly run this in combined multi-start since sp.minimize is max(CPU-thread) bound.
             # Here we manually VMAP and JIT the opt and ver steps
             self.solver = ScipyMinimize
@@ -314,7 +314,7 @@ class FFSatSolver(abc.ABC):
             pass
 
     def peak_memory_estimation(self, x0: Array, fixed_vars: Array, weights: tuple[Array, ...]) -> int:
-        runner = self.run if self.sol_name not in ["sp-lbfgsb"] else self.eval_fun
+        runner = self.run if self.algo not in ["sp-lbfgsb"] else self.eval_fun
         traced = runner.trace(x0, fixed_vars, weights)
         lowered = traced.lower()
         compiled = lowered.compile()
@@ -330,7 +330,7 @@ class FFSatSolver(abc.ABC):
 
     def warmup(self, warmup_data: tuple[Array, Array, tuple[Array, ...]], counting: bool = False) -> None:
         if warmup_data:
-            runner = self.run if self.sol_name not in ["sp-lbfgsb"] else self.eval_fun
+            runner = self.run if self.algo not in ["sp-lbfgsb"] else self.eval_fun
             x0, fixed_vars, weights = warmup_data
             logger.info("Warmup Run (Dummy Data Compilation)")
             t0 = time()
