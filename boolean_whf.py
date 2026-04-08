@@ -335,7 +335,7 @@ class ClauseProcessor:
                 The clause is trivial and should be dropped instead of evaluated as well - e.g
                 clause $c = \texttt{CARD}_{\geq 0}(x_1, x_2,\ldots)$ is just $FE_c = -1$ (always SAT).
 
-            N.B. $\texttt{CARD}_{\geq k} \equiv -\texttt{CARD}_{<k} \equiv \texttt{CARD}_{\leq k-1}$
+            N.B. $\texttt{CARD}_{\geq k} \equiv -\texttt{CARD}_{<k} \equiv \texttt{CARD}_{\leq k-1}$ (normalised in loading when part of Accelerated Fourier SAT)
             These should be detected and handled long before this function is called, but for posterity:
                 $n = k \Rightarrow$ d = np.full(n + 1, (1 /(1 << (n - 1))), dtype=float); d[::2] *= -1; d[0] += 1
                 $k=0\Rightarrow$ d = np.zeros(n + 1, dtype=float); d[0] = -1

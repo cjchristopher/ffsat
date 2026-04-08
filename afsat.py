@@ -7,6 +7,7 @@ import logging
 import math
 import os
 import sys
+import shutil
 from argparse import ArgumentParser as ArgParse
 from collections import Counter, defaultdict
 from contextlib import nullcontext
@@ -69,7 +70,7 @@ from jax import Array
 from jax.sharding import Mesh, NamedSharding
 from sparklines import sparklines
 from tqdm.auto import tqdm
-from utils import get_gpu_l2_cache_size
+from utils import get_gpu_l2_cache_size, LOG_LEVELS
 
 from boolean_whf import Objective
 from sat_loader import PBSATFormula
@@ -360,7 +361,7 @@ def run_solver(
 
     if not benchmark:
         sparkline_height = 5
-        hist_width = min(os.get_terminal_size().columns if sys.stdin.isatty() else 100, solver.maxiter)
+        hist_width = min(shutil.get_terminal_size().columns, solver.maxiter)
         iters_histo = sparklines({x: 0 for x in range(1, hist_width)}.values(), num_lines=sparkline_height)  # type: ignore
         histbars = [tqdm(desc=" ", position=x, bar_format="{desc}", leave=True) for x in range(len(iters_histo))]
         infobars = [tqdm(desc=" ", position=x + len(iters_histo), bar_format="{desc}", leave=True) for x in range(2)]
@@ -780,7 +781,6 @@ if __name__ == "__main__":
         + "JAX_LOGGING_LEVEL=DEBUG TF_CPP_MIN_LOG_LEVEL=[X] TF_CPP_MAX_VLOG_LEVEL=[X]"
         + "JAX_TRACEBACK_FILTERING=off",
     )
-    LOG_LEVELS = ["DEBUG", "INFO", "WARNING", "ERROR"]
     ap.add_argument("file", help="The file to process")
     ap.add_argument("-y", "--profile", action="store_true", help="Enable profiling")
     ap.add_argument("-t", "--timeout", type=int, default=300, help="Maximum runtime (timeout seconds)")

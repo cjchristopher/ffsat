@@ -6,6 +6,7 @@ import os
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
+LOG_LEVELS = ["DEBUG", "INFO", "WARNING", "ERROR"]
 
 # TODO: Implement config file passing and setting instead of all command line switches.
 @dataclass

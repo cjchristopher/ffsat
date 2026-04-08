@@ -72,18 +72,41 @@ def parse_xor_constraint(vars, var_cnt) -> tuple[str, int]:
 
 
 def convert_file(input_file, output_file) -> None:
-    with open(input_file, "r") as infile, open(output_file, "w") as outfile:
+    with open(input_file, "r") as infile:
         var_cnt = 0
-        pbo_cons = []
+        cls_cnt = 0
         for line in infile:
-            words = line.split(" ")
+            words = line.split()
+            if not words:
+                continue
             if words[0] == "c":
                 continue
             if not var_cnt:
-                if words[0] == "p" and words[1] in ("hybrid", "pbo"):
+                if words[0] == "p" and words[1] in ("opb", "pbo"):
+                    raise ValueError(
+                        "Input appears to already be OPB/PBO format. "
+                        "hybrid_to_pbo.py only converts non-OPB formats (e.g. cnf/hybrid)."
+                    )
+                if words[0] == "p" and words[1] in ("hybrid", "cnf"):
                     var_cnt = int(words[2])
                     cls_cnt = int(words[3])
                     continue
+
+        if not var_cnt:
+            raise ValueError(
+                "Unsupported or missing input header. Expected 'p cnf ...' or 'p hybrid ...'."
+            )
+
+    with open(input_file, "r") as infile, open(output_file, "w") as outfile:
+        pbo_cons = []
+        for line in infile:
+            words = line.split()
+            if not words:
+                continue
+            if words[0] == "c":
+                continue
+            if words[0] == "p":
+                continue
 
             if words[0] == "h":
                 words = words[1:]

@@ -132,11 +132,13 @@ class PBSATFormula(object):
                 logger.error(f"Line {idx}: Malformed clause: {line}")
                 raise ValueError
 
+            card = 0
+
+            # Normalise k for CARD/EK where it can be negative or a non-trivial inequality
             if clause_type in ("card", "ek"):
                 # Catch implicit inequality (is just an int) - e.g. >= card or < card (for negative)
                 try:
                     card = int(tokens[lit_offset])
-
                 # Must have an explicit inequality indicator or is malformed/typo
                 except ValueError:
                     # Check for strict inequality. All cardinality clauses are normalised to default forms:
@@ -155,8 +157,6 @@ class PBSATFormula(object):
                         logger.error(f"Line {idx}: EK constraint cannot have inequality: {line}")
                         raise ValueError
                 lit_offset += 1
-            else:
-                card = 0
 
             lits = [int(val) for val in tokens[lit_offset:-1]]  # drop trailing 0
             n = len(lits)
@@ -189,6 +189,15 @@ class PBSATFormula(object):
 
             # Correct CARD/EK edge cases -- flag, correct if possible.
             if clause_type in ("card", "ek"):
+                if card < 0:
+                    # $CARD_{k<0}(X)\equiv CARD_{n-k+1}(\lnot X)$, $EK_{-j}(X) \equiv EK_k(\lnot X)$
+                    logger.debug(f"Line {idx}: Normalizing -ve {clause_type.upper()}-k to +ve k (negated): {line}")
+                    lits = [-lit for lit in lits]
+                    if clause_type == "card":
+                        card = n + card + 1
+                    else:
+                        card = -card
+
                 if card > n:
                     logger.error(f"Line {idx}: CARD/EK claues with card > #lits (always UNSAT): {line}")
                     raise UnsatError
@@ -201,7 +210,7 @@ class PBSATFormula(object):
                             raise UnsatError
                         else:
                             self.unit_prefix.add(lit)
-                            return
+                    return
 
                 if card == 0:
                     if clause_type == "card":
@@ -215,6 +224,7 @@ class PBSATFormula(object):
                                 raise UnsatError
                             else:
                                 self.unit_prefix.add(-lit)
+                        return
 
                 if card == 1:
                     if clause_type == "card":
@@ -224,6 +234,18 @@ class PBSATFormula(object):
                         logger.debug(f"Line {idx}: Adjusting non-trivial EK-1 clause to EO: {line}")
                         clause_type = "eo"
                     card = 0
+
+                if card == n - 1:
+                    if clause_type == "card":
+                        logger.debug(f"Line {idx}: Adjusting CARD-(n-1) clause to AMO over negated literals: {line}")
+                        lits = [-lit for lit in lits]
+                        clause_type = "amo"
+                        card = 0
+                    else:
+                        logger.debug(f"Line {idx}: Adjusting EK-(n-1) clause to EO over negated literals: {line}")
+                        lits = [-lit for lit in lits]
+                        clause_type = "eo"
+                        card = 0
 
             self.clause_sets.setdefault(ClauseSignature(clause_type, n, card), []).append(lits)
 
@@ -257,7 +279,7 @@ class PBSATFormula(object):
                         __process_clause(idx, line, tokens)
 
                 calc_n_clause = sum([len(clause_set) for clause_set in self.clause_sets.values()])
-                calc_n_var = max([max([max(lits) for lits in clause_set]) for clause_set in self.clause_sets.values()])
+                calc_n_var = max(abs(lit) for clauses in self.clause_sets.values() for lits in clauses for lit in lits)
 
                 if calc_n_clause != self.n_clause or calc_n_var != self.n_var:
                     logger.warning(
