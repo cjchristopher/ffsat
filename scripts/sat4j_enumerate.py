@@ -36,6 +36,15 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Stop after this many solutions (0 means no limit)",
     )
+    parser.add_argument(
+        "--orig-vars",
+        type=int,
+        default=0,
+        help=(
+            "Count/project models using variables 1..N only (0 means all variables). "
+            "Useful when transformed instances introduce auxiliary variables."
+        ),
+    )
     parser.add_argument("--verbose", action="store_true", help="Print each found model")
     parser.add_argument(
         "--rebuild-java",
@@ -86,11 +95,19 @@ def compile_java_enumerator(jar_path: Path, rebuild: bool) -> None:
         )
 
 
-def run_java_enumerator(jar_path: Path, opb_path: Path, max_solutions: int, verbose: bool) -> int:
+def run_java_enumerator(
+    jar_path: Path,
+    opb_path: Path,
+    max_solutions: int,
+    orig_vars: int,
+    verbose: bool,
+) -> int:
     cp = os.pathsep.join([str(JAVA_BUILD_DIR), str(jar_path)])
     cmd = ["java", "-cp", cp, JAVA_CLASS_NAME, str(opb_path)]
     if max_solutions > 0:
         cmd.extend(["--max-solutions", str(max_solutions)])
+    if orig_vars > 0:
+        cmd.extend(["--orig-vars", str(orig_vars)])
     if verbose:
         cmd.append("--verbose")
 
@@ -106,6 +123,10 @@ def run_java_enumerator(jar_path: Path, opb_path: Path, max_solutions: int, verb
 
 def main() -> int:
     args = parse_args()
+
+    if args.orig_vars < 0:
+        print("--orig-vars must be >= 0", file=sys.stderr)
+        return 2
 
     input_path = Path(args.input_file).expanduser().resolve()
     jar_path = Path(args.sat4j_jar).expanduser().resolve()
@@ -136,6 +157,7 @@ def main() -> int:
             jar_path=jar_path,
             opb_path=opb_path,
             max_solutions=args.max_solutions,
+            orig_vars=args.orig_vars,
             verbose=args.verbose,
         )
 
