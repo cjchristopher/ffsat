@@ -256,6 +256,7 @@ def run_solver(
     weight_decay: float = 0.9, #alpha,
     unsat_h: int = 0,
     solver_tol: float = 1e-3,
+    binary_v: bool = False
 ) -> float:
     devices = jax.devices("gpu")[:n_devices]
     n_prefix = len(prefix_vectors) if prefix_vectors is not None else 1
@@ -365,13 +366,15 @@ def run_solver(
         iters_histo = sparklines({x: 0 for x in range(1, hist_width)}.values(), num_lines=sparkline_height)  # type: ignore
         histbars = [tqdm(desc=" ", position=x, bar_format="{desc}", leave=True) for x in range(len(iters_histo))]
         infobars = [tqdm(desc=" ", position=x + len(iters_histo), bar_format="{desc}", leave=True) for x in range(2)]
-        pbstr = f"{batches_done % restart_thresh}/{restart_thresh}" if restart_thresh else f"{batches_done} batches"
-        newlines = '\n' * sparkline_height
+        if restart_thresh > 1:
+            desc = f"\n{restart_ct} restarts (next: {batches_done % restart_thresh}/{restart_thresh} batches)"
+        else:
+            desc = f"\n{batches_done} batches"
         pbar = tqdm(
             total=timeout,
             leave=True,
             position=len(infobars) + len(histbars),
-            desc=f"{newlines}restart {restart_ct} ({pbstr} -- best={best_unsat})",
+            desc=f"{desc} [MAX-SAT cost: {best_unsat}]",
             bar_format="{l_bar}{bar}|{elapsed}/" + f"{str(timeout_m).zfill(2)}:{str(timeout_s).zfill(2)}" + "{postfix}",
             postfix=f"{0:.2f}s/it",
         )
@@ -446,8 +449,6 @@ def run_solver(
 
         if batch_best_unsat == 0:
             best_x = np.asarray(batch_best_x).copy()
-            # if not counting and not benchmark:
-            #     print("Found a solution!")
             if ttfs == 0:
                 ttfs = tbatch - t0
             found_sol = True
@@ -594,7 +595,7 @@ def run_solver(
                 penalty = jnp.atleast_1d(jnp.concatenate(restart_batch_unsats, axis=1).sum(axis=0))
                 worst = penalty.max()
 
-                logger.debug(f"# Restart: {restart_ct} | Current  (#unsat): {best_unsat}")
+                logger.debug(f"# Restart: {restart_ct} | Best MAX-SAT cost (#unsat): {best_unsat}")
                 logger.debug(f"Unsat counts: {penalty}, \nBest: {best_unsat_clauses_idx}")
 
                 pen_start = 0
@@ -616,11 +617,14 @@ def run_solver(
                 restart_ct += 1
 
         if not benchmark:
-            pbstr = f"{batches_done % restart_thresh}/{restart_thresh}" if restart_thresh else f"{batches_done} batches"
+            if restart_thresh > 1:
+                desc = f"{restart_ct} restarts (next: {batches_done % restart_thresh}/{restart_thresh} batches)"
+            else:
+                desc = f"{batches_done} batches"
             pbelapse = pbar.format_dict["elapsed"]
             pbn = pbar.format_dict["n"]
             batch_elapsed = end_batch - start_batch
-            pbar.set_description(f"restart {restart_ct} ({pbstr} -- best={best_unsat})")
+            pbar.set_description(f"{desc} [MAX-SAT cost: {best_unsat}]")
             if pbn + batch_elapsed > timeout:
                 pbar.update(timeout - pbelapse)
             else:
@@ -637,29 +641,45 @@ def run_solver(
                 infobars[x].close()
         pbar.close()
 
+    sol_info = f"Accelerated Fourier SAT ({optimiser})"
+    print(f"c {"-"*len(sol_info)}")
+    print(f"c {sol_info}")
+    print(f"c {"-"*len(sol_info)}")
+
     if len(all_sols):
+        print("s SATISFIABLE")
         for sol_i, sol in enumerate(all_sols.keys()):
-            sol_string = "v"
+            if not counting and first_sol != sol:
+                continue
+            sol_str_d = []
+            sol_str_b = []
             for var, assigned in enumerate(np.sign(sol).astype(int)):
-                lit = (var + 1) * assigned
-                sol_string += f" {-lit}"
+                lit = (var + 1) * assigned # assigned=-1 means "True"
+                sol_str_d.append(f"{-lit}")
+                sol_str_b.append("0" if assigned > 0 else "1")
+            sol_str = "".join(sol_str_b) if binary_v else " ".join(sol_str_d)
             if counting:
-                logger.info(f"{sol_i+1}: {sol_string}")
+                logger.info(f"{sol_i+1}: v {sol_str} 0")
             elif first_sol == sol:
-                print(sol_string)
+                print(f"v {sol_str} 0")
                 break
     else:
-        assign_str = "v"
+        assign_str_d = []
+        assign_str_b = []
         assignment = []
         pr_signs = ["?", "-", ""]
         for var, assigned in enumerate(np.sign(best_x).astype(int)):
             lit = var + 1
-            assign_str += f" {pr_signs[int(assigned)]}{lit}"
+            assign_str_d.append(f"{pr_signs[int(assigned)]}{lit}")
+            assign_str_b.append("0" if assigned > 0 else ("1" if assigned < 0 else "-"))
             if assigned:
                 assignment.append(lit * -assigned)
+        assign_str = "".join(assign_str_b) if binary_v else " ".join(assign_str_d)
 
-        logger.info(f"Best assignment found (0 energy denoted as ?lit) [{best_unsat} UNSAT]:")
-        logger.info(f"{assign_str}")
+        print("s UNKNOWN")
+        print("c Best found MAX-SAT assignment (zero energy variables omitted or -):")
+        print(f"o {best_unsat}")
+        print(f"v {assign_str} 0")
 
         assignment = set(assignment)
         if logger.isEnabledFor(logging.DEBUG):
@@ -679,6 +699,7 @@ def run_solver(
                         find_idx -= obj_len
             for i, w in enumerate(weights):
                 logger.debug(f"\t{set((np.array(objs[i].clauses.types)).flatten().tolist())},{objs[i].clauses.lits.shape} \n{w}")
+    print(f"c {"-"*len(sol_info)}")
 
     if logger.isEnabledFor(logging.INFO):
         if ttfs:
@@ -728,7 +749,8 @@ def main(
     unsat_h: float = 0,
     sample_method: str = "bias",
     solver_tol: float = 1e-3,
-    optimiser: str = "pgd"
+    optimiser: str = "pgd",
+    binary_v: bool = False
 ) -> None:
     if not file:
         raise ValueError("No problem file specified")
@@ -763,7 +785,8 @@ def main(
         unsat_h=int(unsat_h * 2 * n_var) if unsat_h else 0,
         sample_method=sample_method,
         solver_tol=solver_tol,
-        optimiser=optimiser
+        optimiser=optimiser,
+        binary_v=binary_v,
     )
 
     logger.info(f"Time reading input: {read_time}")
@@ -786,9 +809,10 @@ if __name__ == "__main__":
     ap.add_argument("-t", "--timeout", type=int, default=300, help="Maximum runtime (timeout seconds)")
     ap.add_argument("-b", "--batch", type=int, default=-1, help="Batch size. -1 computes heuristic maximum")
     ap.add_argument("-f", "--fuzz", type=int, default=0, help="Number of times to attempt fuzzing per batch")
-    ap.add_argument("-r", "--restart_thresh", type=int, default=0, help="Batches before reweighting (never if 0)")
+    ap.add_argument("-r", "--restart_thresh", type=int, default=1, help="Batches before reweighting (never if 0)")
     ap.add_argument("-n", "--n_devices", type=int, default=n_devices, help="Devices (eg. GPUs) to use. 0 uses all")
-    ap.add_argument("-e", "--benchmark", action="store_true", help="Benchmark mode (reduce output)")
+    ap.add_argument("-e", "--benchmark", action="store_true", default=True, help="Benchmark mode (reduce output)")
+    ap.add_argument("--progress", action="store_false", dest="benchmark", help="Display progress stats (equiv to -e False)")
     ap.add_argument("-c", "--counting", type=int, default=0, help="Counting mode. Count solns until timeout")
     ap.add_argument("-w", "--warmup", action="store_true", help="Perform a warmup run before starting timer")
     ap.add_argument("-d", "--debug", choices=LOG_LEVELS, default="ERROR", help=f"Set logging level ({LOG_LEVELS})")
@@ -797,11 +821,12 @@ if __name__ == "__main__":
     ap.add_argument("-i", "--iters_desc", type=int, default=100, help="Solver maximum iterations")
     ap.add_argument("-u", "--unsat_thresh", type=float, default=0, help="Stop when #UNSAT drops below threshold (PLE)")
     ap.add_argument("-m", "--sample_meth", type=str, default="bias", help="Starting point sampler (bias,coin,uniform)")
-    ap.add_argument("-q", "--solver_tol", type=float, default=1e-3, help="Solver convergence tolerance (if supported)")
-    ap.add_argument("-o", "--optimiser", "--optimizer", dest="optimiser", type=str, default="pgd", help="Optimisation routine")
+    ap.add_argument("-q", "--solver_tol", type=float, default=1e-3, help="Optimiser convergence tolerance (if supported)")
+    ap.add_argument("-o", "--optimiser", "--optimizer", dest="optimiser", type=str, default="pgd", help="Optimiser")
     ap.add_argument("--stdout_log", action="store_true", help="Send log output to stdout instead of stderr")
     ap.add_argument("--anomaly_quit", action="store_true", default=False)
     ap.add_argument("--log_propagate", action="store_true", default=False)
+    ap.add_argument("--binary_v", action="store_true", default=False, help="Short form solution string")
 
     arg = ap.parse_args()
     logger.info(f"{arg._get_args()}")
@@ -816,7 +841,7 @@ if __name__ == "__main__":
     logging.basicConfig(
         level=getattr(logging, arg.debug.upper()),
         # format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-        format="%(name)s - %(levelname)s - %(message)s",
+        format="c %(name)s - %(levelname)s - %(message)s",
         handlers=[
             logging.StreamHandler(sys.stdout if arg.stdout_log else sys.stderr),
             # Optional: logging.FileHandler('sat_loader.log')  # Also log to file
@@ -842,7 +867,9 @@ if __name__ == "__main__":
             unsat_h=arg.unsat_thresh,
             sample_method=arg.sample_meth,
             solver_tol=arg.solver_tol,
-            optimiser=arg.optimiser
+            optimiser=arg.optimiser,
+            binary_v=arg.binary_v
         )
         if arg.profile:
             jax.profiler.save_device_memory_profile("memory.prof")
+    logger.debug(f"Running with configuration: {arg}")

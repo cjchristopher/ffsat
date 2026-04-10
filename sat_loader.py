@@ -289,7 +289,7 @@ class PBSATFormula(object):
                     self.n_clause = calc_n_clause
                     self.n_var = calc_n_var
 
-                print(
+                logger.info(
                     f"Processed file: {dimacs_file}, with {len(self.clause_sets)} objectives (clause sets)"
                     f" - a total of {self.n_clause} clauses over {self.n_var} variables"
                 )

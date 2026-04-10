@@ -315,7 +315,12 @@ class ClauseProcessor:
             This does not simplify to as clean a closed form, so we require some manual computation.
             The dominating step for small $n$ would be np.polyfromroots, at $O(n\cdot log^{2}(n))$ for a clause of $n$ variables.
             However, to maintain numerical stability for larger $n$, we use a bespoke implementation in $O(n^2)$ for all $n$.
+            """
 
+            r"""
+            N.B. $\texttt{CARD}_{\geq k} \equiv -\texttt{CARD}_{<k} \equiv \texttt{CARD}_{\leq k-1}$ (normalised in loading when part of Accelerated Fourier SAT)
+
+            N.B. These should be detected and handled long before this function is called, but for posterity:
             Special Cases:
             $k=n$:
                 e.g. clause $c = \texttt{CARD}_{\geq n}(x_1, x_2,\ldots, x_n)$ is just $c = x_1 \land x_2 \land \ldots \land x_n$.
@@ -335,8 +340,7 @@ class ClauseProcessor:
                 The clause is trivial and should be dropped instead of evaluated as well - e.g
                 clause $c = \texttt{CARD}_{\geq 0}(x_1, x_2,\ldots)$ is just $FE_c = -1$ (always SAT).
 
-            N.B. $\texttt{CARD}_{\geq k} \equiv -\texttt{CARD}_{<k} \equiv \texttt{CARD}_{\leq k-1}$ (normalised in loading when part of Accelerated Fourier SAT)
-            These should be detected and handled long before this function is called, but for posterity:
+            Preserved code:
                 $n = k \Rightarrow$ d = np.full(n + 1, (1 /(1 << (n - 1))), dtype=float); d[::2] *= -1; d[0] += 1
                 $k=0\Rightarrow$ d = np.zeros(n + 1, dtype=float); d[0] = -1
             """
