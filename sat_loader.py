@@ -169,8 +169,8 @@ class PBSATFormula(object):
             if n == 1:
                 match clause_type:
                     case "nae" | "xor":
-                        logger.error(f"Line {idx}: Length 1 NAE/XOR clause type has no semantics: {line}")
-                        raise ValueError
+                        logger.error(f"Line {idx}: Length 1 NAE/XOR clause has no SAT semantics (UNSAT): {line}")
+                        raise UnsatError
 
                     case "amo":
                         logger.debug(f"Line {idx}: Skipping length 1 AMO clause (trivially SAT): {line}")
@@ -276,7 +276,13 @@ class PBSATFormula(object):
                         if len(tokens) < 2 or tokens[-1] != "0":
                             logger.error(f"Line {idx}: Malformed clause: {line}")
                             raise ValueError
-                        __process_clause(idx, line, tokens)
+                        try:
+                            __process_clause(idx, line, tokens)
+                        except UnsatError as e:
+                            print('s UNSATISFIABLE')
+                            raise e
+                        except ValueError as e:
+                            print(f"Error processing clause: {e}")
 
                 calc_n_clause = sum([len(clause_set) for clause_set in self.clause_sets.values()])
                 calc_n_var = max(abs(lit) for clauses in self.clause_sets.values() for lits in clauses for lit in lits)
