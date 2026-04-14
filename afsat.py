@@ -324,7 +324,7 @@ def run_solver(
             )
             empty_prefix = jax.device_put(jnp.full((batch, 1), fill_value=False, dtype=bool), batch_sharding)
 
-        if not benchmark and logger.isEnabledFor(logging.DEBUG):
+        if not benchmark and logger.isEnabledFor(logging.INFO):
             if mesh.shape["batch"] > 1:
                 logger.info("Batch sharding:")
                 jax.debug.visualize_array_sharding(x_guess)
@@ -519,55 +519,25 @@ def run_solver(
             first_sol = tuple(np.sign(best_x).astype(int).tolist())
             sol_locs = jnp.argwhere(jnp.where(opt_unsat_ct < 1, 1, 0)).flatten().tolist()
             batch_sols = [tuple(row.astype(int).tolist()) for row in np.sign(np.asarray(opt_x0[sol_locs, :]))]
-            if not counting:
-                all_sols[tuple(np.sign(opt_x0[batch_best_loc, :]).astype(int).tolist())] += 1
-            else:
+            if counting:
                 for sol in batch_sols:
                     all_sols[sol] += 1
-            if not benchmark and not counting:
-                for x in range(len(histbars)):
-                    histbars[x].close()
-                for x in range(len(infobars)):
-                    infobars[x].close()
-                pbar.close()
-                print("SAT! at sample {}".format(max(batches_done, 0) * batch + batch_best_loc))
+            else:
+                all_sols[tuple(np.sign(opt_x0[batch_best_loc, :]).astype(int).tolist())] += 1
+                if not benchmark:
+                    # Close tqdm. 
+                    #TODO: We probably don't need this at all if we change tqdm usage (progress) to context manager.
+                    #TODO: we should change benchmark to track "progress instead" as the following is much clearer:
+                    # # if progress and not counting:
+                    for x in range(len(histbars)):
+                        histbars[x].close()
+                    for x in range(len(infobars)):
+                        infobars[x].close()
+                    pbar.close()
+                    print("SAT! at sample {}".format(max(batches_done, 0) * batch + batch_best_loc))
                 break
 
         opt_iters_local = np.array(opt_iters.flatten()).tolist()
-
-        if not benchmark:
-            # Update tqdm info/histogram bars
-            opt_iters_counts = Counter(opt_iters_local)
-            bin_width = solver.maxiter / hist_width if solver.maxiter > hist_width else 1
-            iters_histo = [0] * hist_width
-            for k, v in opt_iters_counts.items():
-                bin_idx = int(k / bin_width)
-                if bin_idx == hist_width:
-                    bin_idx -= 1
-                iters_histo[bin_idx] += v
-            iters_histo_tq = sparklines(iters_histo, num_lines=5)  # type: ignore
-
-            max_iter_str = str(solver.maxiter)
-            max_iter_len = len(max_iter_str)
-            if solver.maxiter >= hist_width:
-                pad_bar = " " * (hist_width - 1 - max_iter_len)
-                infobars[0].set_description_str("0" + pad_bar + max_iter_str)
-            else:
-                end_label = str(hist_width - 1)
-                end_label_len = len(end_label)
-                pad_left = " " * (solver.maxiter - max_iter_len)
-                pad_right = " " * (hist_width - 1 - solver.maxiter - end_label_len)
-                infobars[0].set_description_str("0" + pad_left + max_iter_str + pad_right + end_label)
-
-            for x in range(len(histbars)):
-                histbars[x].set_description_str(iters_histo_tq[x])
-
-            infobars[-1].set_description_str(
-                f"Optim Iters: min: {jnp.min(opt_iters)}, "
-                + f"max: {jnp.max(opt_iters)} ({opt_iters_counts[solver.maxiter]}), "
-                + f"median: {int(jnp.median(opt_iters))}"
-            )
-
         batches_done += 1
         end_batch = time()
 
@@ -617,6 +587,43 @@ def run_solver(
                 restart_ct += 1
 
         if not benchmark:
+            # Update tqdm info/histogram bars
+            # TODO: This should be our own tqdm wrapper, with the histogram display as a param, and we can
+            # remove this update code and the init code since it pollutes our flow here.
+            # would allow for easier paraming of the "height" of the histo display, maybe even split display
+            # e.g. left histo is current batch, right histo is aggregate.
+            # TODO: since we are sharding as well, this might be a wrapper over jax-tqdm instead!
+            opt_iters_counts = Counter(opt_iters_local)
+            bin_width = solver.maxiter / hist_width if solver.maxiter > hist_width else 1
+            iters_histo = [0] * hist_width
+            for k, v in opt_iters_counts.items():
+                bin_idx = int(k / bin_width)
+                if bin_idx == hist_width:
+                    bin_idx -= 1
+                iters_histo[bin_idx] += v
+            iters_histo_tq = sparklines(iters_histo, num_lines=5)  # type: ignore
+
+            max_iter_str = str(solver.maxiter)
+            max_iter_len = len(max_iter_str)
+            if solver.maxiter >= hist_width:
+                pad_bar = " " * (hist_width - 1 - max_iter_len)
+                infobars[0].set_description_str("0" + pad_bar + max_iter_str)
+            else:
+                end_label = str(hist_width - 1)
+                end_label_len = len(end_label)
+                pad_left = " " * (solver.maxiter - max_iter_len)
+                pad_right = " " * (hist_width - 1 - solver.maxiter - end_label_len)
+                infobars[0].set_description_str("0" + pad_left + max_iter_str + pad_right + end_label)
+
+            for x in range(len(histbars)):
+                histbars[x].set_description_str(iters_histo_tq[x])
+
+            infobars[-1].set_description_str(
+                f"Optim Iters: min: {jnp.min(opt_iters)}, "
+                + f"max: {jnp.max(opt_iters)} ({opt_iters_counts[solver.maxiter]}), "
+                + f"median: {int(jnp.median(opt_iters))}"
+            )
+
             if restart_thresh > 1:
                 desc = f"{restart_ct} restarts (next: {batches_done % restart_thresh}/{restart_thresh} batches)"
             else:
@@ -633,6 +640,7 @@ def run_solver(
 
     tsolve = time() - t0
     if not benchmark:
+        # TODO: The above todo re tqdm context would remove the need to close these.
         if len(histbars):
             for x in range(len(histbars)):
                 histbars[x].close()
