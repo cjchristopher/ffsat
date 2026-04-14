@@ -563,22 +563,23 @@ def run_solver(
             if not (batches_done % restart_thresh):
                 # Gather unsat counts by clause
                 penalty = jnp.atleast_1d(jnp.concatenate(restart_batch_unsats, axis=1).sum(axis=0))
-                worst = penalty.max()
+                if jnp.any(penalty):
+                    worst = penalty.max() 
 
-                logger.debug(f"# Restart: {restart_ct} | Best MAX-SAT cost (#unsat): {best_unsat}")
-                logger.debug(f"Unsat counts: {penalty}, \nBest: {best_unsat_clauses_idx}")
+                    logger.debug(f"# Restart: {restart_ct} | Best MAX-SAT cost (#unsat): {best_unsat}")
+                    logger.debug(f"Unsat counts: {penalty}, \nBest: {best_unsat_clauses_idx}")
 
-                pen_start = 0
-                new_weights: list[Array] = []
-                for weight in weights:
-                    obj_clauses = len(weight)
-                    pen_end = pen_start + obj_clauses
-                    w_pens = penalty[pen_start:pen_end]
-                    new_weight = weight_decay * weight + (1 - weight_decay) * w_pens / worst
-                    new_weights.append(new_weight)
-                    pen_start += obj_clauses
+                    pen_start = 0
+                    new_weights: list[Array] = []
+                    for weight in weights:
+                        obj_clauses = len(weight)
+                        pen_end = pen_start + obj_clauses
+                        w_pens = penalty[pen_start:pen_end]
+                        new_weight = weight_decay * weight + (1 - weight_decay) * w_pens / worst
+                        new_weights.append(new_weight)
+                        pen_start += obj_clauses
 
-                weights = shard_tree(tuple(new_weights), obj_sharding)
+                    weights = shard_tree(tuple(new_weights), obj_sharding)
                 restart_batch_unsats = []
                 restart_unsats = []
                 restart_iters = []
@@ -821,7 +822,7 @@ if __name__ == "__main__":
     ap.add_argument("-n", "--n_devices", type=int, default=n_devices, help="Devices (eg. GPUs) to use. 0 uses all")
     ap.add_argument("-e", "--benchmark", action="store_true", default=True, help="Benchmark mode (reduce output)")
     ap.add_argument("--progress", action="store_false", dest="benchmark", help="Display progress stats (equiv to -e False)")
-    ap.add_argument("-c", "--counting", type=int, default=0, help="Counting mode. Count solns until timeout")
+    ap.add_argument("-c", "--counting", action="store_true", help="Counting mode. Count solns until timeout")
     ap.add_argument("-w", "--warmup", action="store_true", help="Perform a warmup run before starting timer")
     ap.add_argument("-d", "--debug", choices=LOG_LEVELS, default="ERROR", help=f"Set logging level ({LOG_LEVELS})")
     ap.add_argument("-s", "--rand_seed", action="store_true", help="Randomise seed")
