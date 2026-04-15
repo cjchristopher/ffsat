@@ -534,7 +534,7 @@ def run_solver(
                     for x in range(len(infobars)):
                         infobars[x].close()
                     pbar.close()
-                    print("SAT! at sample {}".format(max(batches_done, 0) * batch + batch_best_loc))
+                    logger.info("SAT! at sample {}".format(max(batches_done, 0) * batch + batch_best_loc))
                 break
 
         opt_iters_local = np.array(opt_iters.flatten()).tolist()
@@ -665,6 +665,9 @@ def run_solver(
             sol_str = "".join(sol_str_b) if binary_v else " ".join(sol_str_d)
             if counting:
                 logger.info(f"{sol_i+1}: v {sol_str} 0")
+                if not sol_i:
+                    print("c ENUMERATING - example solution (of possibly many):")
+                    print(f"v {sol_str} 0")
             elif first_sol == sol:
                 print(f"v {sol_str} 0")
                 break

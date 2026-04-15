@@ -2,11 +2,35 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
 LOG_LEVELS = ["DEBUG", "INFO", "WARNING", "ERROR"]
+
+
+class LogThrottle:
+    """Throttles repeated logger.debug messages. After `limit` calls with the same key,
+    further messages are suppressed. Call flush() to emit suppressed counts."""
+
+    def __init__(self, logger: logging.Logger, limit: int = 5):
+        self.logger = logger
+        self.limit = limit
+        self._counts: dict[str, int] = {}
+
+    def debug(self, key: str, msg: str) -> None:
+        count = self._counts.get(key, 0) + 1
+        self._counts[key] = count
+        if count <= self.limit:
+            self.logger.debug(msg)
+
+    def flush(self) -> None:
+        for key, count in self._counts.items():
+            suppressed = count - self.limit
+            if suppressed > 0:
+                self.logger.debug(f"... suppressed {suppressed} further '{key}' messages")
+        self._counts.clear()
 
 # TODO: Implement config file passing and setting instead of all command line switches.
 @dataclass
