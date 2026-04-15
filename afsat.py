@@ -581,10 +581,6 @@ def run_solver(
 
                     weights = shard_tree(tuple(new_weights), obj_sharding)
                 restart_batch_unsats = []
-                restart_unsats = []
-                restart_iters = []
-                restart_evals = []
-                restart_flips = []
                 restart_ct += 1
 
         if not benchmark:
