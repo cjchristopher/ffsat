@@ -18,6 +18,28 @@ class UnsatError(Exception):
     pass
 
 
+class LogThrottle:
+    """Throttles repeated logger.debug messages. After `limit` calls with the same key,
+    further messages are suppressed. Call flush() to emit suppressed counts."""
+
+    def __init__(self, limit: int = 5):
+        self.limit = limit
+        self._counts: dict[str, int] = {}
+
+    def debug(self, key: str, msg: str) -> None:
+        count = self._counts.get(key, 0) + 1
+        self._counts[key] = count
+        if count <= self.limit:
+            logger.debug(msg)
+
+    def flush(self) -> None:
+        for key, count in self._counts.items():
+            suppressed = count - self.limit
+            if suppressed > 0:
+                logger.debug(f"... suppressed {suppressed} further '{key}' messages")
+        self._counts.clear()
+
+
 class PBSATFormula(object):
     """A class for parsing and processing pseudo-boolean SAT formulas from DIMACS and hybrid formats.
     This class handles loading SAT problem instances from files, processing various constraint types
@@ -100,6 +122,8 @@ class PBSATFormula(object):
             dimacs_file (str): Path to the DIMACS format file to be parsed
         """
 
+        throttle = LogThrottle()
+
         def __process_clause(idx: int, line: str, tokens: list[str]) -> None:
             """
             Helper function to processes and validates a single clause, updating self.clause_sets
@@ -163,7 +187,7 @@ class PBSATFormula(object):
 
             # Clause extracted. Check for errors in spec, correct generic edge cases.
             if n == 0:
-                logger.debug(f"Line {idx}: Skipping empty clause")
+                throttle.debug("empty", f"Line {idx}: Skipping empty clause")
                 return
 
             if n == 1:
@@ -173,11 +197,11 @@ class PBSATFormula(object):
                         raise UnsatError
 
                     case "amo":
-                        logger.debug(f"Line {idx}: Skipping length 1 AMO clause (trivially SAT): {line}")
+                        throttle.debug("u_amo", f"Line {idx}: Skipping length 1 AMO clause (trivially SAT): {line}")
                         return
 
                     case "eo" | "cnf":
-                        logger.debug(f"Line {idx}: Prefixing unit literals enoded as EO: {line}")
+                        throttle.debug("u_eo", f"Line {idx}: Prefixing unit literals enoded as EO: {line}")
                         if -lits[0] in self.unit_prefix:
                             logger.error(f"Conflict found among unit literals - {dimacs_file} is UNSAT")
                             raise UnsatError
@@ -190,8 +214,8 @@ class PBSATFormula(object):
             # Correct CARD/EK edge cases -- flag, correct if possible.
             if clause_type in ("card", "ek"):
                 if card < 0:
-                    # $CARD_{k<0}(X)\equiv CARD_{n-k+1}(\lnot X)$, $EK_{-j}(X) \equiv EK_k(\lnot X)$
-                    logger.debug(f"Line {idx}: Normalizing -ve {clause_type.upper()}-k to +ve k (negated): {line}")
+                    # $CARD_{k<0}(X)\equiv CARD_{n-k+1}(\lnot X)$, $EK_{-k}(X) \equiv EK_k(\lnot X)$
+                    throttle.debug("neg_k", f"Line {idx}: Normalising -ve {clause_type.upper()} to +ve negated: {line}")
                     lits = [-lit for lit in lits]
                     if clause_type == "card":
                         card = n + card + 1
@@ -203,7 +227,7 @@ class PBSATFormula(object):
                     raise UnsatError
 
                 if card == n:
-                    logger.debug(f"Line {idx}: Prefixing {n} unit literals enoded as CARD/EK-{n}: {line}")
+                    throttle.debug("k=n", f"Line {idx}: Prefixing {n} unit literals enoded as CARD/EK-{n}: {line}")
                     for lit in lits:
                         if -lit in self.unit_prefix:
                             logger.error(f"Conflict found among unit literals - {dimacs_file} is UNSAT")
@@ -214,10 +238,10 @@ class PBSATFormula(object):
 
                 if card == 0:
                     if clause_type == "card":
-                        logger.debug(f"Line {idx}: Skipping CARD-0 clause (trivially SAT): {line}")
+                        throttle.debug("c0", f"Line {idx}: Skipping CARD-0 clause (trivially SAT): {line}")
                         return
                     else:
-                        logger.debug(f"Line {idx}: Prefixing negated EK-0 clause (trivially SAT): {line}")
+                        throttle.debug("ek0", f"Line {idx}: Prefixing negated EK-0 clause (trivially SAT): {line}")
                         for lit in lits:
                             if lit in self.unit_prefix:
                                 logger.error(f"Conflict found among unit literals - {dimacs_file} is UNSAT")
@@ -228,24 +252,32 @@ class PBSATFormula(object):
 
                 if card == 1:
                     if clause_type == "card":
-                        logger.debug(f"Line {idx}: Adjusting non-trivial CARD-1 clause to CNF: {line}")
+                        throttle.debug("c1", f"Line {idx}: Adjusting non-trivial CARD-1 clause to CNF: {line}")
                         clause_type = "cnf"
                     else:
-                        logger.debug(f"Line {idx}: Adjusting non-trivial EK-1 clause to EO: {line}")
+                        throttle.debug("ek1", f"Line {idx}: Adjusting non-trivial EK-1 clause to EO: {line}")
                         clause_type = "eo"
                     card = 0
 
                 if card == n - 1:
                     if clause_type == "card":
-                        logger.debug(f"Line {idx}: Adjusting CARD-(n-1) clause to AMO over negated literals: {line}")
+                        throttle.debug("cn1", f"Line {idx}: Adjusting CARD-(n-1) clause to negated AMO : {line}")
                         lits = [-lit for lit in lits]
                         clause_type = "amo"
                         card = 0
                     else:
-                        logger.debug(f"Line {idx}: Adjusting EK-(n-1) clause to EO over negated literals: {line}")
+                        throttle.debug("ekn1", f"Line {idx}: Adjusting EK-(n-1) clause to negated EO: {line}")
                         lits = [-lit for lit in lits]
                         clause_type = "eo"
                         card = 0
+
+            if n == 2:
+                match clause_type:
+                    case "nae" | "eo":
+                        throttle.debug("2xor", f"Line {idx}: Adjusting Length 2 NAE/EO clause to XOR: {line}")
+                        clause_type = "xor"
+                    case _:
+                        pass
 
             self.clause_sets.setdefault(ClauseSignature(clause_type, n, card), []).append(lits)
 
@@ -284,6 +316,7 @@ class PBSATFormula(object):
                         except ValueError as e:
                             print(f"Error processing clause: {e}")
 
+                throttle.flush()
                 calc_n_clause = sum([len(clause_set) for clause_set in self.clause_sets.values()])
                 calc_n_var = max(abs(lit) for clauses in self.clause_sets.values() for lits in clauses for lit in lits)
 

@@ -128,7 +128,7 @@ python afsat.py [options] input_file.cnf
 - `-i, --iters_desc INT`: Descent iteration depth (default: 100)
 - `-d, --debug LEVEL`: Set logging level: DEBUG, INFO, WARNING, or ERROR (default: ERROR)
 - `-e, --benchmark`: Enable benchmark mode (reduces output verbosity)
-- `-c, --counting INT`: Counting mode - count solutions until timeout (default: 0, disabled)
+- `-c, --counting`: Counting mode - count/enumerate solutions until timeout (default: False (off))
 - `-w, --warmup`: Perform a warmup run before starting the timer (may improve performance with JAX compilation cache)
 - `-s, --rand_seed`: Randomize the random seed (default: uses fixed seed for reproducibility)
 - `-p, --prefix FILE`: Path to file containing fixed variable assignments (one assignment per line, using SAT solver output format with negated literals)
