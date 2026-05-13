@@ -10,6 +10,7 @@ import numpy as np
 from numpy.typing import NDArray
 
 from boolean_whf import Clause, ClauseProcessor, Clauses, ClauseSignature, FFSAT_DFTCache, Objective, clause_type_ids
+from utils import LogThrottle
 
 logger = logging.getLogger(__name__)
 
@@ -122,7 +123,7 @@ class PBSATFormula(object):
             dimacs_file (str): Path to the DIMACS format file to be parsed
         """
 
-        throttle = LogThrottle()
+        throttle = LogThrottle(logger)
 
         def __process_clause(idx: int, line: str, tokens: list[str]) -> None:
             """

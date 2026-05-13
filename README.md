@@ -71,9 +71,9 @@ This solver extends the DIMACS format to support various constraint types using 
 
      `1 -2 3 0` or `h 1 -2 3 0`
 
-   - **XOR constraints**: Exactly one variable must be true
+   - **XOR constraints**: An odd number of literals must be true
 
-     `xor 1 2 3 0` or `h x 1 2 3 0` or `x 1 2 3 0`
+     `xor 1 2 -3 0` or `h x 1 2 -3 0` or `x 1 2 -3 0`
 
    - **NAE (Not-All-Equal) constraints**: Not all literals can have the same value
 

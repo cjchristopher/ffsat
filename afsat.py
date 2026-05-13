@@ -353,11 +353,11 @@ def run_solver(
     best_unsat_clauses_idx = np.array([0])
     batches_done = 0
     restart_ct = 0
-    restart_batch_unsats = []
     restart_unsats = []
-    restart_iters = []
-    restart_evals = []
-    restart_flips = []
+    all_unsats = []
+    all_iters = []
+    all_evals = []
+    all_flips = []
     timeout_m, timeout_s = divmod(timeout, 60)
 
     if not benchmark:
@@ -392,9 +392,15 @@ def run_solver(
         x0_dev = jax.device_put(x0.copy(), batch_sharding)
         fixed_vars = jax.device_put(fixed_vars, batch_sharding)
 
+        if logger.isEnabledFor(logging.WARNING):
+            print("c Initial Assigment", list(np.asarray(x0[0,:].copy())))
+
         # Run solver.
         opt_x0, opt_unsat, opt_iters, opt_unsat_ct, aux_info = solver.run(x0_dev, fixed_vars, weights)
         accum_time_descent += time() - tloop
+
+        if logger.isEnabledFor(logging.WARNING):
+            print("c Final Assigment", list(np.asarray(opt_x0[0,:].copy())))
 
         # Flag and bail if we encounter anomalous behaviour
         if logger.isEnabledFor(logging.WARNING):
@@ -542,11 +548,11 @@ def run_solver(
         end_batch = time()
 
         if restart_thresh:
-            restart_batch_unsats.append(np.asarray(opt_unsat))
-            restart_unsats.extend(np.array(opt_unsat_ct.flatten()).tolist())
-            restart_evals.extend(np.array(eval_scores.flatten()).tolist())
-            restart_iters.extend(opt_iters_local)
-            restart_flips.extend(np.array(flips.flatten()).tolist())
+            restart_unsats.append(np.asarray(opt_unsat))
+            all_unsats.extend(np.array(opt_unsat_ct.flatten()).tolist())
+            all_evals.extend(np.array(eval_scores.flatten()).tolist())
+            all_iters.extend(opt_iters_local)
+            all_flips.extend(np.array(flips.flatten()).tolist())
             # TODO: There is probably some way to calculate how many restarts are needed given the batch size to get
             # enough of a sample to ensure the reweighting is meaningful. If there's 500 clauses and we are only running
             # batches of 100, we probably need restart_thresh to be more than 1, at the very least. I think? I don't
@@ -562,7 +568,7 @@ def run_solver(
 
             if not (batches_done % restart_thresh):
                 # Gather unsat counts by clause
-                penalty = jnp.atleast_1d(jnp.concatenate(restart_batch_unsats, axis=1).sum(axis=0))
+                penalty = jnp.atleast_1d(jnp.concatenate(restart_unsats, axis=1).sum(axis=0))
                 if jnp.any(penalty):
                     worst = penalty.max() 
 
@@ -580,7 +586,7 @@ def run_solver(
                         pen_start += obj_clauses
 
                     weights = shard_tree(tuple(new_weights), obj_sharding)
-                restart_batch_unsats = []
+                restart_unsats = []
                 restart_ct += 1
 
         if not benchmark:
@@ -731,11 +737,11 @@ def run_solver(
             logger.info("X-UQSOLS 0")
         logger.info(f"X-RATIODESC {(batches_done * batch) / accum_time_descent} POINTS/DESCTIME")
         logger.info(f"X-RATIOLOOP {(batches_done * batch) / tsolve} POINTS/LOOPTIME")
-        logger.info(f"X-ITERHISTO {dict(Counter(restart_iters))}")
-        logger.info(f"X-RAWEVAL {restart_evals}")
-        logger.info(f"X-RAWUNSAT {restart_unsats}")
-        logger.info(f"X-RAWITER {restart_iters}")
-        logger.info(f"X-RAWFLIPS {restart_flips}")
+        logger.info(f"X-ITERHISTO {dict(Counter(all_iters))}")
+        logger.info(f"X-RAWEVAL {all_evals}")
+        logger.info(f"X-RAWUNSAT {all_unsats}")
+        logger.info(f"X-RAWITER {all_iters}")
+        logger.info(f"X-RAWFLIPS {all_flips}")
         logger.info("END EXP")
     return tsolve
 
@@ -839,6 +845,7 @@ if __name__ == "__main__":
     arg = ap.parse_args()
     logger.info(f"{arg._get_args()}")
 
+    # TODO: This should not be a psuedo-global like this???
     QUIT_ON_ANOMALY: bool = arg.anomaly_quit
 
 

@@ -107,8 +107,8 @@ def build_eval_verify(objs: tuple[Objective, ...], unbounded: bool) -> tuple[tup
             for clause_type, template in UNSAT_RULES.items()
             if clause_type_ids[clause_type] in type_ids_present
         ]
-        # fmt: off
 
+        # fmt: off
         def evaluate_xor(x: Array, fixed_vars: Array, weight: Array) -> Array:
             x = jnp.where(fixed_vars, jax.lax.stop_gradient(x), x)
             assignment = sign * x[lits]                                           # (N,K) * (N,K) = (N,K)
@@ -124,7 +124,7 @@ def build_eval_verify(objs: tuple[Objective, ...], unbounded: bool) -> tuple[tup
         def evaluate(x: Array, fixed_vars: Array, weight: Array) -> Array:
             x = jnp.where(fixed_vars, jax.lax.stop_gradient(x), x)
             assignment = sign * x[lits]                                           # (N,K) * (N,K) = (N,K)
-            # Add dimension to capture K+1 shifted roots for K terms of the clause.
+            # Add dim to capture K+1 shifted roots for K terms of the clause.
             fourier_domain = dft + assignment[:, None, :]                         # (N,(K+1),1) + (N,_,K) = (N,(K+1),K)
             esp_freq = jnp.prod(fourier_domain, axis=-1, where=forward_mask)      # (N,(K+1))
             esp_eval = idft * esp_freq                                            # (1,(K+1)) * (N,(K+1)) = (N,(K+1))
@@ -136,8 +136,8 @@ def build_eval_verify(objs: tuple[Objective, ...], unbounded: bool) -> tuple[tup
             else:
             # Affine shift to [0,1]-cube and add error term for unbounded optimisation.
                 return ((jnp.atleast_1d(x_eval)+1)/2)**2 + (x**2 - 1)**(lits.shape[-1])
-        # fmt: on
 
+        # fmt: on
         def verify(x: Array) -> Array:
             assignment = sign * x[lits]
             unsat = jnp.zeros(clause_count, dtype=bool)
@@ -148,9 +148,7 @@ def build_eval_verify(objs: tuple[Objective, ...], unbounded: bool) -> tuple[tup
                 unsat = unsat | jnp.where(type_mask, unsat_clauses, False)
             return unsat
 
-        eval_f = evaluate
-        if jnp.all(types == clause_type_ids["xor"]):
-            eval_f = evaluate_xor
+        eval_f = evaluate if ~jnp.all(types == clause_type_ids["xor"]) else evaluate_xor
         return eval_f, verify
 
     eval_fns: tuple[EvalFn]
@@ -167,7 +165,6 @@ def seq_eval_verify(eval_fns: tuple[EvalFn, ...], verify_fns: tuple[VerifyFn, ..
     def seq_evals(x: Array, fixed_vars: Array, weights: tuple[Array, ...]) -> tuple[Array, Array | tuple[Array, Array]]:
         costs = [evaluate(x, fixed_vars, weight) for (evaluate, weight) in zip(eval_fns, weights)]
         cost = jnp.sum(jnp.array(costs))
-        # jax.debug.print("{} {}", cost, costs, ordered=True)
         return cost, (x, cost)  # returns costs in aux for breakdown by objective. aux info - remove when consolidating
 
     def seq_verifies(x: Array) -> Array:
