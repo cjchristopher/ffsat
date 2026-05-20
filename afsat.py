@@ -275,7 +275,8 @@ def run_solver(
     solver = Optimiser(seq_evaluator, seq_verifier, algorithm=optimiser, maxiter=maxiters, tol=solver_tol)
 
     seed = int(time()) if rand_seed else 0
-    logger.debug(f"seed={seed}, rand_seed={rand_seed}")
+    logger.info(f"seed={seed}, rand_seed={rand_seed}")
+    # logger.debug(f"seed={seed}, rand_seed={rand_seed}")
     key = jax.random.PRNGKey(np.array(seed))
     f_key = jax.random.PRNGKey(np.array(seed + 1))
 
@@ -392,15 +393,17 @@ def run_solver(
         x0_dev = jax.device_put(x0.copy(), batch_sharding)
         fixed_vars = jax.device_put(fixed_vars, batch_sharding)
 
-        if logger.isEnabledFor(logging.WARNING):
-            print("c Initial Assigment", list(np.asarray(x0[0,:].copy())))
+        if logger.isEnabledFor(logging.WARNING) and batches_done < 5:
+            print(f"c Initial Assigment (batch {batches_done}, point 0)", np.asarray(x0[0,:].copy().tolist()))
 
         # Run solver.
         opt_x0, opt_unsat, opt_iters, opt_unsat_ct, aux_info = solver.run(x0_dev, fixed_vars, weights)
         accum_time_descent += time() - tloop
 
-        if logger.isEnabledFor(logging.WARNING):
-            print("c Final Assigment", list(np.asarray(opt_x0[0,:].copy())))
+        if logger.isEnabledFor(logging.WARNING) and batches_done < 5:
+            print(f"c Final Assigment (batch {batches_done}, point 0)", np.asarray(opt_x0[0,:].copy().tolist()))
+            print("c DIFFERENT?", not all((x0[0,:] == opt_x0[0,:]).tolist()))
+            # print(aux_info)
 
         # Flag and bail if we encounter anomalous behaviour
         if logger.isEnabledFor(logging.WARNING):
@@ -445,13 +448,16 @@ def run_solver(
             best_unsat = np.asarray(batch_best_unsat).copy()
             best_unsat_clauses_idx = np.asarray(batch_best_unsat_clauses_idx).copy()
 
+        tbatch = time()
+        found_sol = False
+
         if unsat_h and batch_best_unsat <= unsat_h:
             ttfs = time() - t0
             found_sol = True
+            opt_iters_local = np.array(opt_iters.flatten()).tolist()
+            batches_done += 1
+            end_batch = time()
             break
-
-        tbatch = time()
-        found_sol = False
 
         if batch_best_unsat == 0:
             best_x = np.asarray(batch_best_x).copy()
@@ -541,6 +547,9 @@ def run_solver(
                         infobars[x].close()
                     pbar.close()
                     logger.info("SAT! at sample {}".format(max(batches_done, 0) * batch + batch_best_loc))
+                opt_iters_local = np.array(opt_iters.flatten()).tolist()
+                batches_done += 1
+                end_batch = time()
                 break
 
         opt_iters_local = np.array(opt_iters.flatten()).tolist()
